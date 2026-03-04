@@ -151,7 +151,7 @@ class ClipboardSync:
                 self._show_notification(
                     title="Synced to Clipboard",
                     message=compact_message(self.last_file_content),
-                    timeout=2,
+                    timeout=1,
                 )
 
                 # Update clipboard cache immediately to prevent echo

@@ -1,3 +1,1 @@
-@lap .../STORAGE/IMPORTANT/autoclip master ?9
-$ ./clipsync
-2026/03/03 15:14:20 Sync initializ
+/home/lucifer/.local/share/DBeaverData/workspace6/General/Scripts/fx_new_today.sql
