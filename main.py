@@ -7,7 +7,7 @@ from pathlib import Path
 import pyperclip
 from plyer import notification
 
-__version__ = "0.0.2"
+__version__ = "0.2.1"
 
 
 class State(Enum):
@@ -46,7 +46,7 @@ class ClipboardSync:
 
         logging.info(f"Sync initialized on: {self.file_path}")
 
-    def _show_notification(self, title: str, message: str, timeout: int = 3):
+    def _show_notification(self, title: str, message: str, timeout: int = 1):
         if not self.enable_notifications:
             return
         try:
@@ -66,12 +66,27 @@ class ClipboardSync:
             return 0.0
 
     def _safe_paste(self) -> str:
-        """Safely paste from clipboard, handling locks/errors."""
-        try:
-            return pyperclip.paste() or ""
-        except Exception as e:
-            logging.warning(f"Clipboard access failed: {e}")
-            return self.last_clip or ""
+        """Safely paste from clipboard, handling locks/errors with retries."""
+        max_retries = 3
+
+        for attempt in range(max_retries):
+            try:
+                # If successful, we exit immediately
+                return pyperclip.paste() or ""
+            except Exception as e:
+                if attempt < max_retries - 1:
+                    time.sleep(0.05)  # Wait 50ms and try again
+                    continue
+
+                # This was the last attempt; log the error and break the loop
+                error_msg = str(e)
+                if "completed successfully" in error_msg:
+                    logging.debug(f"Clipboard locked by another app: {error_msg}")
+                else:
+                    logging.warning(f"Clipboard access failed: {error_msg}")
+
+        # Moving this outside the loop guarantees a str return path
+        return self.last_clip or ""
 
     def _safe_read(self) -> str:
         """Safely read file, returning empty string on failure."""
@@ -196,9 +211,10 @@ def main():
     # Use resolve() to handle symlinks and absolute paths better
     sync_file = args.file_path.resolve()
 
+    logging.info(
+        f"Sync (v{__version__}) starting with interval {args.interval} seconds, file syncing: {sync_file}. Press Ctrl+C to stop."
+    )
     syncer = ClipboardSync(file_path=sync_file, enable_notifications=not args.no_notify)
-
-    logging.info(f"Sync started (v{__version__}). Ctrl+C to stop.")
 
     state = State.WAITING
     try:
@@ -209,5 +225,5 @@ def main():
         logging.info("Stopped.")
 
 
-if __name__ == "main":
+if __name__ == "__main__":
     main()

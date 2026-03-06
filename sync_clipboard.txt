@@ -1,1 +1,18 @@
-/home/lucifer/.local/share/DBeaverData/workspace6/General/Scripts/fx_new_today.sql
+ DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:55 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:56 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:56 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:57 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:57 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:58 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:58 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:51:59 DEBUG: Clipboard locked by another app: The operation completed successfully.
+2026/03/06 15:52:28 Clipboard -> File (1220 chars)
+2026/03/06 15:52:38 Clipboard -> File (1022 chars)
+2026/03/06 15:57:21 File -> Clipboard (6203 chars)
+2026/03/06 16:00:08 File -> Clipboard (12602 chars)
+2026/03/06 16:00:18 File -> Clipboard (5 chars)
+2026/03/06 16:00:43 File -> Clipboard (10 chars)
+2026/03/06 16:00:48 File -> Clipboard (623 chars)
+2026/03/06 16:03:31 File -> Clipboard (6188 chars)
+2026/03/06 16:03:32 The file C:\Users\HO
