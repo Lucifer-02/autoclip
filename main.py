@@ -1,5 +1,8 @@
 import argparse
 import logging
+import signal
+import sys
+import threading
 import time
 from enum import Enum, auto
 from pathlib import Path
@@ -7,7 +10,7 @@ from pathlib import Path
 import pyperclip
 from plyer import notification
 
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 
 
 class State(Enum):
@@ -28,8 +31,13 @@ def compact_message(content: str, limit: int = 64) -> str:
 
 class ClipboardSync:
     def __init__(self, file_path: Path, enable_notifications: bool = True):
-        self.file_path = file_path
+        # Resolve symlinks for consistent path comparison
+        self.file_path = file_path.resolve()
         self.enable_notifications = enable_notifications
+
+        # Cache glob pattern components to avoid recomputing every cycle
+        self._dir = self.file_path.parent
+        self._glob_pattern = f"{self.file_path.name}*"
 
         # Ensure file exists
         if not self.file_path.exists():
@@ -39,146 +47,160 @@ class ClipboardSync:
                 logging.critical(f"Could not create file {self.file_path}: {e}")
                 raise
 
-        # Cache initial state
-        self.last_clip = self._safe_paste()
-        self.last_mtime = self._get_mtime()
-        self.last_file_content = self._safe_read()
+        # Initialize caches
+        self.last_clip: str = self._safe_paste()
+        self.last_mtime: float = self._get_mtime()
+        self.last_file_content: str = self._safe_read()
 
         logging.info(f"Sync initialized on: {self.file_path}")
 
-    def _show_notification(self, title: str, message: str, timeout: int = 1):
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _show_notification(self, title: str, message: str, timeout: int = 1) -> None:
+        """Show desktop notification in a daemon thread to avoid blocking the loop."""
         if not self.enable_notifications:
             return
-        try:
-            notification.notify(
-                title=title,
-                message=message,
-                timeout=timeout,
-            )
-        except Exception as e:
-            logging.warning(f"Notification failed: {e}")
+
+        def _notify():
+            try:
+                notification.notify(title=title, message=message, timeout=timeout)
+            except Exception as e:
+                logging.warning(f"Notification failed: {e}")
+
+        t = threading.Thread(target=_notify, daemon=True)
+        t.start()
 
     def _get_mtime(self) -> float:
-        """Returns the file modification timestamp."""
+        """Returns the file modification timestamp, or 0.0 on error."""
         try:
             return self.file_path.stat().st_mtime
         except OSError:
             return 0.0
 
     def _safe_paste(self) -> str:
-        """Safely paste from clipboard, handling locks/errors with retries."""
+        """Read clipboard with retries. Returns '' on persistent failure."""
         max_retries = 3
-
         for attempt in range(max_retries):
             try:
-                # If successful, we exit immediately
                 return pyperclip.paste() or ""
             except Exception as e:
                 if attempt < max_retries - 1:
-                    time.sleep(0.05)  # Wait 50ms and try again
+                    time.sleep(0.05)
                     continue
-
-                # This was the last attempt; log the error and break the loop
                 error_msg = str(e)
                 if "completed successfully" in error_msg:
                     logging.debug(f"Clipboard locked by another app: {error_msg}")
                 else:
                     logging.warning(f"Clipboard access failed: {error_msg}")
-
-        # Moving this outside the loop guarantees a str return path
-        return self.last_clip or ""
+        # Return empty string rather than stale content on persistent failure
+        return ""
 
     def _safe_read(self) -> str:
-        """Safely read file, returning empty string on failure."""
+        """Read file as UTF-8 text. Returns '' on any error.
+
+        A single read call avoids the TOCTOU race between a separate
+        stat().st_size == 0 check and the actual read.
+        """
         try:
             return self.file_path.read_text(encoding="utf-8")
         except Exception:
             return ""
 
+    def _check_conflicts(self) -> None:
+        """Log any conflict/duplicate files created by sync tools."""
+        sync_files = [
+            f
+            for f in self._dir.glob(self._glob_pattern)
+            if f.is_file() and f != self.file_path
+        ]
+        if sync_files:
+            logging.warning(
+                f"Potential conflict files detected: {[f.name for f in sync_files]}"
+            )
+
+    # ------------------------------------------------------------------
+    # State machine
+    # ------------------------------------------------------------------
+
     def transition(self, state: State) -> State:
-        """Main State Machine Logic."""
+        """Advance the state machine by one step."""
 
         if state == State.WAITING:
-            # 1. Check Clipboard Change
+            # 1. Check clipboard change
             current_clip = self._safe_paste()
             if current_clip != self.last_clip:
                 self.last_clip = current_clip
                 return State.WRITING_CLIP_TO_FILE
 
-            # 2. File existence check (Handle syncing/deletion)
+            # 2. File existence check
             if not self.file_path.exists():
                 logging.info(f"File {self.file_path} vanished (syncing?), waiting...")
                 return State.WAITING
 
-            # 3. Check for Conflicts (Logging only)
-            sync_files = [
-                f
-                for f in self.file_path.parent.glob(f"{self.file_path.name}*")
-                if f.is_file() and f != self.file_path
-            ]
-            if sync_files:
-                logging.warning(
-                    f"Potential conflict files detected: {[f.name for f in sync_files]}"
-                )
+            # 3. Conflict detection (cached pattern, no extra stat per cycle)
+            self._check_conflicts()
 
-            # 4. Check File Change (Optimization: Check Metadata first)
+            # 4. Check file change by mtime
             current_mtime = self._get_mtime()
-            if current_mtime != self.last_mtime:
-                self.last_mtime = current_mtime
+            if current_mtime == self.last_mtime:
+                return State.WAITING
 
-                # Check if file is empty (often happens during cloud sync lock)
-                if self.file_path.stat().st_size == 0:
-                    logging.info(f"File {self.file_path} is empty, waiting...")
-                    return State.WAITING
+            self.last_mtime = current_mtime
 
-                current_file_content = self._safe_read()
+            # Single read — avoids TOCTOU race between size check and content read
+            current_file_content = self._safe_read()
+            if not current_file_content:
+                logging.info(
+                    f"File {self.file_path} is empty (cloud sync lock?), waiting..."
+                )
+                return State.WAITING
 
-                if current_file_content != self.last_file_content:
-                    self.last_file_content = current_file_content
-                    return State.COPYING_FILE_TO_CLIP
-                else:
-                    logging.info(f"The file {self.file_path} content has not changed.")
+            if current_file_content != self.last_file_content:
+                self.last_file_content = current_file_content
+                return State.COPYING_FILE_TO_CLIP
 
+            logging.info(
+                f"File {self.file_path} mtime changed but content is unchanged."
+            )
             return State.WAITING
 
         if state == State.WRITING_CLIP_TO_FILE:
             logging.info(f"Clipboard -> File ({len(self.last_clip)} chars)")
-
             try:
                 self.file_path.write_text(self.last_clip, encoding="utf-8")
-
-                # CRITICAL: Update file caches immediately after we write
-                # to prevent the script from detecting its own edit as a new change.
+                # Update caches immediately to suppress self-triggered file-change detection
                 self.last_file_content = self.last_clip
                 self.last_mtime = self._get_mtime()
-
-            except IOError as e:
+            except OSError as e:
                 logging.error(f"Write failed: {e}")
-
             return State.WAITING
 
         if state == State.COPYING_FILE_TO_CLIP:
             logging.info(f"File -> Clipboard ({len(self.last_file_content)} chars)")
-
             try:
                 pyperclip.copy(self.last_file_content)
-
+                # Update cache before notification (non-blocking) to prevent echo
+                self.last_clip = self.last_file_content
                 self._show_notification(
                     title="Synced to Clipboard",
                     message=compact_message(self.last_file_content),
                     timeout=1,
                 )
-
-                # Update clipboard cache immediately to prevent echo
-                self.last_clip = self.last_file_content
-
             except Exception as e:
                 logging.error(f"Copy failed: {e}")
-
             return State.WAITING
 
+        return State.WAITING
 
-def main():
+
+# ------------------------------------------------------------------
+# Entry point
+# ------------------------------------------------------------------
+
+
+def main() -> None:
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(message)s",
@@ -186,8 +208,6 @@ def main():
     )
 
     parser = argparse.ArgumentParser(description="Bidirectional Clipboard Sync")
-
-    # Arguments
     parser.add_argument(
         "-f",
         "--file-path",
@@ -196,31 +216,49 @@ def main():
         help="Path to the file used for syncing",
     )
     parser.add_argument(
-        "-i", "--interval", type=float, default=0.5, help="Polling interval in seconds"
+        "-i",
+        "--interval",
+        type=float,
+        default=0.5,
+        help="Polling interval in seconds",
     )
     parser.add_argument(
-        "--no-notify", action="store_true", help="Disable desktop notifications"
+        "--no-notify",
+        action="store_true",
+        help="Disable desktop notifications",
     )
-    # Version Flag
     parser.add_argument(
-        "-v", "--version", action="version", version=f"%(prog)s {__version__}"
+        "-v",
+        "--version",
+        action="version",
+        version=f"%(prog)s {__version__}",
     )
-
     args = parser.parse_args()
 
-    # Use resolve() to handle symlinks and absolute paths better
     sync_file = args.file_path.resolve()
-
     logging.info(
-        f"Sync (v{__version__}) starting with interval {args.interval} seconds, file syncing: {sync_file}. Press Ctrl+C to stop."
+        f"Sync (v{__version__}) starting — interval: {args.interval}s, "
+        f"file: {sync_file}. Press Ctrl+C to stop."
     )
+
     syncer = ClipboardSync(file_path=sync_file, enable_notifications=not args.no_notify)
+
+    # Graceful shutdown on SIGTERM (Ctrl+C is handled by KeyboardInterrupt below)
+    def _handle_sigterm(signum, frame):
+        logging.info("Received SIGTERM. Stopped.")
+        sys.exit(0)
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
 
     state = State.WAITING
     try:
         while True:
+            # Record start time to keep interval drift-free
+            t_start = time.monotonic()
             state = syncer.transition(state)
-            time.sleep(args.interval)
+            elapsed = time.monotonic() - t_start
+            sleep_for = max(0.0, args.interval - elapsed)
+            time.sleep(sleep_for)
     except KeyboardInterrupt:
         logging.info("Stopped.")
 
