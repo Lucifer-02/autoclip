@@ -1,266 +1,295 @@
 import argparse
+import json
 import logging
+import os
+import shutil
 import signal
 import sys
-import threading
 import time
-from enum import Enum, auto
 from pathlib import Path
 
-import pyperclip
-from plyer import notification
+# PyQt6 for Cross-Platform Event-Driven Clipboard (Text, Images, Files)
+from PyQt6.QtCore import QMimeData, QObject, QTimer, QUrl, pyqtSignal
+from PyQt6.QtGui import QGuiApplication, QImage
 
-__version__ = "0.3.0"
+# Watchdog for Cross-Platform Event-Driven File Monitoring
+from watchdog.events import FileSystemEventHandler
+from watchdog.observers import Observer
 
-
-class State(Enum):
-    WAITING = auto()
-    WRITING_CLIP_TO_FILE = auto()
-    COPYING_FILE_TO_CLIP = auto()
-
-
-def compact_message(content: str, limit: int = 64) -> str:
-    """Truncates string for cleaner log/notification output."""
-    if not content:
-        return ""
-    content = content.replace("\n", " ").strip()
-    if len(content) > limit:
-        return content[: (limit - 3)] + "..."
-    return content
+__version__ = "1.0.0"
 
 
-class ClipboardSync:
-    def __init__(self, file_path: Path, enable_notifications: bool = True):
-        # Resolve symlinks for consistent path comparison
-        self.file_path = file_path.resolve()
-        self.enable_notifications = enable_notifications
+class WatcherSignals(QObject):
+    """Bridge to send signals from watchdog's background thread to Qt's Main Thread."""
 
-        # Cache glob pattern components to avoid recomputing every cycle
-        self._dir = self.file_path.parent
-        self._glob_pattern = f"{self.file_path.name}*"
+    meta_changed = pyqtSignal()
 
-        # Ensure file exists
-        if not self.file_path.exists():
-            try:
-                self.file_path.touch()
-            except OSError as e:
-                logging.critical(f"Could not create file {self.file_path}: {e}")
-                raise
 
-        # Initialize caches
-        self.last_clip: str = self._safe_paste()
-        self.last_mtime: float = self._get_mtime()
-        self.last_file_content: str = self._safe_read()
+class SyncDirWatcher(FileSystemEventHandler):
+    """Listens for file system changes triggered by Cloud Sync engines."""
 
-        logging.info(f"Sync initialized on: {self.file_path}")
+    def __init__(self, meta_path: Path, signals: WatcherSignals):
+        super().__init__()
+        self.meta_path = meta_path.resolve()
+        self.signals = signals
+
+    def on_modified(self, event):
+        if event.is_directory:
+            return
+        try:
+            if Path(event.src_path).resolve() == self.meta_path:
+                self.signals.meta_changed.emit()
+        except Exception:
+            pass
+
+    def on_created(self, event):
+        self.on_modified(event)
+
+
+class ClipboardSyncer(QObject):
+    def __init__(self, sync_dir: Path):
+        super().__init__()
+        self.sync_dir = sync_dir.resolve()
+        self.meta_path = self.sync_dir / "meta.json"
+        self.files_dir = self.sync_dir / "files"
+
+        # Setup directories
+        self.sync_dir.mkdir(parents=True, exist_ok=True)
+        self.files_dir.mkdir(parents=True, exist_ok=True)
+
+        # Initialize PyQt GUI Application (Required for OS clipboard access)
+        self.app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+        self.app.setQuitOnLastWindowClosed(False)
+        self.clipboard = self.app.clipboard()
+
+        # States to prevent infinite echo loops
+        self.last_timestamp = 0.0
+        self.is_syncing_to_clipboard = False
+
+        # 1. Setup Event-Driven File Monitoring (Watchdog)
+        self.signals = WatcherSignals()
+        self.signals.meta_changed.connect(self.sync_from_file_to_clipboard)
+
+        self.observer = Observer()
+        self.handler = SyncDirWatcher(self.meta_path, self.signals)
+        self.observer.schedule(self.handler, str(self.sync_dir), recursive=False)
+        self.observer.start()
+
+        # 2. Setup Event-Driven Clipboard Monitoring (PyQt Signals)
+        self.clipboard.dataChanged.connect(self.sync_from_clipboard_to_file)
+
+        logging.info(f"Event-Driven Sync Started on: {self.sync_dir}")
+
+        # Sync on startup if data exists
+        if self.meta_path.exists():
+            self.sync_from_file_to_clipboard()
 
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
-    def _show_notification(self, title: str, message: str, timeout: int = 1) -> None:
-        """Show desktop notification in a daemon thread to avoid blocking the loop."""
-        if not self.enable_notifications:
+    def _clear_directory(self, dir_path: Path):
+        """Empties the temporary files directory."""
+        for item in dir_path.iterdir():
+            try:
+                if item.is_file():
+                    item.unlink()
+                elif item.is_dir():
+                    shutil.rmtree(item, ignore_errors=True)
+            except OSError:
+                pass
+
+    def _write_meta(self, meta: dict):
+        """Atomic write ensures cloud-sync doesn't grab a half-written JSON."""
+        tmp = self.meta_path.with_suffix(".tmp")
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(meta, f)
+        os.replace(tmp, self.meta_path)
+
+    def _read_meta(self) -> dict:
+        """Safely read metadata, retrying if cloud sync has it temporarily locked."""
+        for _ in range(3):
+            try:
+                with open(self.meta_path, "r", encoding="utf-8") as f:
+                    return json.load(f)
+            except (json.JSONDecodeError, OSError):
+                time.sleep(0.1)
+        return {}
+
+    def _wait_for_file(self, path: Path, timeout: int = 15):
+        """Pause to let cloud engines (Dropbox/Drive) finish downloading payload files."""
+        start = time.time()
+        while time.time() - start < timeout:
+            if path.exists():
+                try:
+                    # Test if we can open it (ensures file is no longer locked by OS)
+                    with open(path, "rb"):
+                        return True
+                except OSError:
+                    pass
+            # Keep Qt alive while we wait
+            self.app.processEvents()
+            time.sleep(0.2)
+        raise TimeoutError(f"Cloud sync timeout waiting for {path}")
+
+    def _unblock_clipboard(self):
+        self.is_syncing_to_clipboard = False
+
+    # ------------------------------------------------------------------
+    # Event Callbacks
+    # ------------------------------------------------------------------
+
+    def sync_from_clipboard_to_file(self):
+        """Triggered instantly by OS when User Copies something."""
+        if self.is_syncing_to_clipboard:
+            return  # Ignore events generated by ourselves
+
+        mime = self.clipboard.mimeData()
+        timestamp = time.time()
+        meta = {"timestamp": timestamp, "type": "none", "data": None}
+
+        try:
+            # 1. Handle Copied Files
+            if mime.hasUrls():
+                local_files = [u.toLocalFile() for u in mime.urls() if u.isLocalFile()]
+                if local_files:
+                    self._clear_directory(self.files_dir)
+                    copied_files = []
+                    for f in local_files:
+                        p = Path(f)
+                        if p.exists() and p.is_file():
+                            dest = self.files_dir / p.name
+                            shutil.copy2(p, dest)
+                            copied_files.append(p.name)
+                    if copied_files:
+                        meta["type"] = "files"
+                        meta["data"] = copied_files
+
+            # 2. Handle Copied Images (Screenshots, browser image copy, etc.)
+            elif mime.hasImage():
+                img = self.clipboard.image()
+                if not img.isNull():
+                    img_path = self.sync_dir / "clip.png"
+                    img.save(str(img_path), "PNG")
+                    meta["type"] = "image"
+                    meta["data"] = "clip.png"
+
+            # 3. Handle Text
+            elif mime.hasText():
+                txt = self.clipboard.text()
+                if txt:
+                    txt_path = self.sync_dir / "clip.txt"
+                    txt_path.write_text(txt, encoding="utf-8")
+                    meta["type"] = "text"
+                    meta["data"] = "clip.txt"
+
+            # Finalize Sync
+            if meta["type"] != "none":
+                self._write_meta(meta)
+                self.last_timestamp = timestamp
+
+                log_data = str(meta["data"])
+                if meta["type"] == "files":
+                    log_data = f"{len(meta['data'])} file(s)"
+                elif meta["type"] == "text":
+                    log_data = f"{len(txt)} chars"
+
+                logging.info(f"Local Copy -> Cloud[{meta['type']}] ({log_data})")
+
+        except Exception as e:
+            logging.error(f"Failed to capture clipboard: {e}")
+
+    def sync_from_file_to_clipboard(self):
+        """Triggered instantly by Watchdog when Cloud updates meta.json."""
+        meta = self._read_meta()
+        if not meta:
             return
 
-        def _notify():
-            try:
-                notification.notify(title=title, message=message, timeout=timeout)
-            except Exception as e:
-                logging.warning(f"Notification failed: {e}")
+        timestamp = meta.get("timestamp", 0)
+        # Debounce duplicate Watchdog events or ignore our own writes
+        if timestamp <= self.last_timestamp:
+            return
 
-        t = threading.Thread(target=_notify, daemon=True)
-        t.start()
+        self.last_timestamp = timestamp
+        clip_type = meta.get("type")
+        data = meta.get("data")
 
-    def _get_mtime(self) -> float:
-        """Returns the file modification timestamp, or 0.0 on error."""
+        self.is_syncing_to_clipboard = True
         try:
-            return self.file_path.stat().st_mtime
-        except OSError:
-            return 0.0
+            mime_new = QMimeData()
 
-    def _safe_paste(self) -> str:
-        """Read clipboard with retries. Returns '' on persistent failure."""
-        max_retries = 3
-        for attempt in range(max_retries):
-            try:
-                return pyperclip.paste() or ""
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.05)
-                    continue
-                error_msg = str(e)
-                if "completed successfully" in error_msg:
-                    logging.debug(f"Clipboard locked by another app: {error_msg}")
-                else:
-                    logging.warning(f"Clipboard access failed: {error_msg}")
-        # Return empty string rather than stale content on persistent failure
-        return ""
+            if clip_type == "text":
+                txt_path = self.sync_dir / data
+                self._wait_for_file(txt_path)
+                mime_new.setText(txt_path.read_text(encoding="utf-8"))
+                self.clipboard.setMimeData(mime_new)
 
-    def _safe_read(self) -> str:
-        """Read file as UTF-8 text. Returns '' on any error.
+            elif clip_type == "image":
+                img_path = self.sync_dir / data
+                self._wait_for_file(img_path)
+                self.clipboard.setImage(QImage(str(img_path)))
 
-        A single read call avoids the TOCTOU race between a separate
-        stat().st_size == 0 check and the actual read.
-        """
-        try:
-            return self.file_path.read_text(encoding="utf-8")
-        except Exception:
-            return ""
+            elif clip_type == "files":
+                urls = []
+                for fname in data:
+                    fpath = self.files_dir / fname
+                    self._wait_for_file(fpath)
+                    urls.append(QUrl.fromLocalFile(str(fpath)))
+                mime_new.setUrls(urls)
+                self.clipboard.setMimeData(mime_new)
 
-    def _check_conflicts(self) -> None:
-        """Log any conflict/duplicate files created by sync tools."""
-        sync_files = [
-            f
-            for f in self._dir.glob(self._glob_pattern)
-            if f.is_file() and f != self.file_path
-        ]
-        if sync_files:
-            logging.warning(
-                f"Potential conflict files detected: {[f.name for f in sync_files]}"
-            )
+            logging.info(f"Cloud Sync -> Local Clipboard [{clip_type}]")
 
-    # ------------------------------------------------------------------
-    # State machine
-    # ------------------------------------------------------------------
+        except TimeoutError as te:
+            logging.warning(te)
+        except Exception as e:
+            logging.error(f"Failed to sync to clipboard: {e}")
+        finally:
+            # Unblock clipboard events after Qt has processed them (prevents Echo loop)
+            QTimer.singleShot(200, self._unblock_clipboard)
 
-    def transition(self, state: State) -> State:
-        """Advance the state machine by one step."""
-
-        if state == State.WAITING:
-            # 1. Check clipboard change
-            current_clip = self._safe_paste()
-            if current_clip != self.last_clip:
-                self.last_clip = current_clip
-                return State.WRITING_CLIP_TO_FILE
-
-            # 2. File existence check
-            if not self.file_path.exists():
-                logging.info(f"File {self.file_path} vanished (syncing?), waiting...")
-                return State.WAITING
-
-            # 3. Conflict detection (cached pattern, no extra stat per cycle)
-            self._check_conflicts()
-
-            # 4. Check file change by mtime
-            current_mtime = self._get_mtime()
-            if current_mtime == self.last_mtime:
-                return State.WAITING
-
-            self.last_mtime = current_mtime
-
-            # Single read — avoids TOCTOU race between size check and content read
-            current_file_content = self._safe_read()
-            if not current_file_content:
-                logging.info(
-                    f"File {self.file_path} is empty (cloud sync lock?), waiting..."
-                )
-                return State.WAITING
-
-            if current_file_content != self.last_file_content:
-                self.last_file_content = current_file_content
-                return State.COPYING_FILE_TO_CLIP
-
-            logging.info(
-                f"File {self.file_path} mtime changed but content is unchanged."
-            )
-            return State.WAITING
-
-        if state == State.WRITING_CLIP_TO_FILE:
-            logging.info(f"Clipboard -> File ({len(self.last_clip)} chars)")
-            try:
-                self.file_path.write_text(self.last_clip, encoding="utf-8")
-                # Update caches immediately to suppress self-triggered file-change detection
-                self.last_file_content = self.last_clip
-                self.last_mtime = self._get_mtime()
-            except OSError as e:
-                logging.error(f"Write failed: {e}")
-            return State.WAITING
-
-        if state == State.COPYING_FILE_TO_CLIP:
-            logging.info(f"File -> Clipboard ({len(self.last_file_content)} chars)")
-            try:
-                pyperclip.copy(self.last_file_content)
-                # Update cache before notification (non-blocking) to prevent echo
-                self.last_clip = self.last_file_content
-                self._show_notification(
-                    title="Synced to Clipboard",
-                    message=compact_message(self.last_file_content),
-                    timeout=1,
-                )
-            except Exception as e:
-                logging.error(f"Copy failed: {e}")
-            return State.WAITING
-
-        return State.WAITING
+    def stop(self):
+        self.observer.stop()
+        self.observer.join()
 
 
-# ------------------------------------------------------------------
-# Entry point
-# ------------------------------------------------------------------
-
-
-def main() -> None:
+def main():
     logging.basicConfig(
         level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
+        format="%(asctime)s[%(levelname)s] %(message)s",
         datefmt="%H:%M:%S",
     )
 
-    parser = argparse.ArgumentParser(description="Bidirectional Clipboard Sync")
+    parser = argparse.ArgumentParser(description="Rich Multi-format Clipboard Sync")
     parser.add_argument(
-        "-f",
-        "--file-path",
+        "-d",
+        "--dir",
         type=Path,
-        default=Path("./sync_clipboard.txt"),
-        help="Path to the file used for syncing",
-    )
-    parser.add_argument(
-        "-i",
-        "--interval",
-        type=float,
-        default=0.5,
-        help="Polling interval in seconds",
-    )
-    parser.add_argument(
-        "--no-notify",
-        action="store_true",
-        help="Disable desktop notifications",
-    )
-    parser.add_argument(
-        "-v",
-        "--version",
-        action="version",
-        version=f"%(prog)s {__version__}",
+        default=Path("./sync_clipboard_dir"),
+        help="Directory path used for syncing (e.g., inside Dropbox)",
     )
     args = parser.parse_args()
 
-    sync_file = args.file_path.resolve()
-    logging.info(
-        f"Sync (v{__version__}) starting — interval: {args.interval}s, "
-        f"file: {sync_file}. Press Ctrl+C to stop."
-    )
+    # Qt manages the event loop, no 'while True:' required.
+    app = QGuiApplication.instance() or QGuiApplication(sys.argv)
+    syncer = ClipboardSyncer(sync_dir=args.dir)
 
-    syncer = ClipboardSync(file_path=sync_file, enable_notifications=not args.no_notify)
+    # Graceful exit handling for Ctrl+C
+    def handle_sigint(sig, frame):
+        logging.info("Shutting down...")
+        syncer.stop()
+        app.quit()
 
-    # Graceful shutdown on SIGTERM (Ctrl+C is handled by KeyboardInterrupt below)
-    def _handle_sigterm(signum, frame):
-        logging.info("Received SIGTERM. Stopped.")
-        sys.exit(0)
+    signal.signal(signal.SIGINT, handle_sigint)
+    signal.signal(signal.SIGTERM, handle_sigint)
 
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    # Python + PyQt integration trick:
+    # A dummy timer is required so Ctrl+C triggers properly in the console.
+    timer = QTimer()
+    timer.timeout.connect(lambda: None)
+    timer.start(500)
 
-    state = State.WAITING
-    try:
-        while True:
-            # Record start time to keep interval drift-free
-            t_start = time.monotonic()
-            state = syncer.transition(state)
-            elapsed = time.monotonic() - t_start
-            sleep_for = max(0.0, args.interval - elapsed)
-            time.sleep(sleep_for)
-    except KeyboardInterrupt:
-        logging.info("Stopped.")
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":
