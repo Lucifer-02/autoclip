@@ -1,0 +1,3 @@
+c started at /media/lucifer/STORAGE/IMPORTANT/autoclip/sync_dir
+INFO:root:[FSM] Event: CLIPBOARD_CHANGED (state=IDLE)
+INFO:root:[FSM] IDLE → SYNCING_T
