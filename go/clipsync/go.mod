@@ -1,12 +1,10 @@
 module clipsync
 
-go 1.24.0
-
-toolchain go1.24.4
+go 1.26.2
 
 require (
+	github.com/atotto/clipboard v0.1.4
 	github.com/gen2brain/beeep v0.11.2
-	golang.design/x/clipboard v0.7.1
 )
 
 require (
@@ -19,8 +17,5 @@ require (
 	github.com/sergeymakinen/go-bmp v1.0.0 // indirect
 	github.com/sergeymakinen/go-ico v1.0.0 // indirect
 	github.com/tadvi/systray v0.0.0-20190226123456-11a2b8fa57af // indirect
-	golang.org/x/exp/shiny v0.0.0-20250606033433-dcc06ee1d476 // indirect
-	golang.org/x/image v0.28.0 // indirect
-	golang.org/x/mobile v0.0.0-20250606033058-a2a15c67f36f // indirect
-	golang.org/x/sys v0.41.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
 )

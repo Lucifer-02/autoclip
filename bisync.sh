@@ -1,5 +1,5 @@
 #!/bin/bash 
-LOCAL_PATH="/media/lucifer/STORAGE/IMPORTANT/autoclip/" 
+LOCAL_PATH="/data/IMPORTANT/autoclip/" 
 DRIVE="vcb" 
 
 /usr/bin/rclone bisync $DRIVE:sync "$LOCAL_PATH" --include "sync_clipboard.txt" --verbose --resync 
@@ -9,4 +9,3 @@ while true; do
   echo "Bisync complete. Resuming watch..." 
   sleep 0.3 
 done
-

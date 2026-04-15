@@ -1,7 +1,6 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
 	"log"
@@ -12,269 +11,279 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/atotto/clipboard"
 	"github.com/gen2brain/beeep"
-	"golang.design/x/clipboard"
 )
 
-const version = "0.4.0"
+const version = "0.3.0"
 
+// State represents the state machine states
+type State int
+
+const (
+	Waiting State = iota
+	WritingClipToFile
+	CopyingFileToClip
+)
+
+// compactMessage truncates string for cleaner log/notification output.
+// Uses runes to correctly handle multi-byte UTF-8 characters.
 func compactMessage(content string, limit int) string {
 	if content == "" {
 		return ""
 	}
-	content = strings.ReplaceAll(content, "\n", " ")
-	content = strings.TrimSpace(content)
-	if len(content) > limit {
-		return content[:limit-3] + "..."
+	content = strings.TrimSpace(strings.ReplaceAll(content, "\n", " "))
+	runes := []rune(content)
+	if len(runes) > limit {
+		return string(runes[:limit-3]) + "..."
 	}
-	return content
+	return string(runes)
 }
 
+// ClipboardSync holds the state and configuration for the sync process
 type ClipboardSync struct {
 	filePath            string
-	dirPath             string
+	dir                 string
 	globPattern         string
 	enableNotifications bool
 
-	// lastFileContent is the last content we wrote to OR read from the file.
-	// It is used to suppress echoing a file-triggered write back to the file watcher,
-	// and to suppress echoing a clipboard-triggered write back to the clipboard watcher.
-	lastFileContent string
-	lastMtime       time.Time
+	lastClip         string
+	lastMTime        time.Time
+	lastFileContent  string
 }
 
-func NewClipboardSync(filePath string, enableNotifications bool) (*ClipboardSync, error) {
-	// Resolve symlinks so path comparisons are always against the real file.
-	resolved, err := filepath.EvalSymlinks(filePath)
+// NewClipboardSync initializes and returns a new ClipboardSync instance
+func NewClipboardSync(path string, enableNotifications bool) (*ClipboardSync, error) {
+	absPath, err := filepath.Abs(path)
 	if err != nil {
-		if !os.IsNotExist(err) {
-			return nil, fmt.Errorf("could not resolve symlinks for %s: %w", filePath, err)
-		}
-		resolved = filePath
+		return nil, fmt.Errorf("failed to resolve path: %w", err)
 	}
 
-	// Ensure file exists.
-	if _, err := os.Stat(resolved); os.IsNotExist(err) {
-		f, err := os.Create(resolved)
+	dir := filepath.Dir(absPath)
+	name := filepath.Base(absPath)
+	globPattern := filepath.Join(dir, name+"*")
+
+	// Ensure file exists
+	if _, err := os.Stat(absPath); os.IsNotExist(err) {
+		file, err := os.Create(absPath)
 		if err != nil {
-			return nil, fmt.Errorf("could not create file %s: %w", resolved, err)
+			log.Fatalf("Could not create file %s: %v", absPath, err)
 		}
-		f.Close()
+		file.Close()
 	}
 
-	cs := &ClipboardSync{
-		filePath:            resolved,
-		dirPath:             filepath.Dir(resolved),
-		globPattern:         filepath.Base(resolved) + "*",
+	c := &ClipboardSync{
+		filePath:            absPath,
+		dir:                 dir,
+		globPattern:         globPattern,
 		enableNotifications: enableNotifications,
 	}
 
-	cs.lastFileContent = cs.safeRead()
-	cs.lastMtime = cs.getMtime()
+	// Initialize caches
+	c.lastClip = c.safePaste()
+	c.lastMTime = c.getMTime()
+	c.lastFileContent = c.safeRead()
 
-	log.Printf("Sync initialized on: %s", resolved)
-	return cs, nil
+	log.Printf("Sync initialized on: %s", c.filePath)
+	return c, nil
 }
 
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
 // Helpers
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
 
-func (cs *ClipboardSync) showNotification(title, message string) {
-	if !cs.enableNotifications {
+func (c *ClipboardSync) showNotification(title, message string) {
+	if !c.enableNotifications {
 		return
 	}
+	// Run in a goroutine to avoid blocking the loop
 	go func() {
-		if err := beeep.Notify(title, message, ""); err != nil {
-			log.Printf("WARNING: Notification failed: %v", err)
+		err := beeep.Notify(title, message, "")
+		if err != nil {
+			log.Printf("Notification failed: %v", err)
 		}
 	}()
 }
 
-func (cs *ClipboardSync) getMtime() time.Time {
-	info, err := os.Stat(cs.filePath)
+func (c *ClipboardSync) getMTime() time.Time {
+	info, err := os.Stat(c.filePath)
 	if err != nil {
-		return time.Time{}
+		return time.Time{} // Returns zero value on error
 	}
 	return info.ModTime()
 }
 
-// safeRead performs a single read so the emptiness check and content are
-// always consistent (avoids the TOCTOU race of stat-then-read).
-func (cs *ClipboardSync) safeRead() string {
-	data, err := os.ReadFile(cs.filePath)
+func (c *ClipboardSync) safePaste() string {
+	maxRetries := 3
+	for attempt := 0; attempt < maxRetries; attempt++ {
+		text, err := clipboard.ReadAll()
+		if err == nil {
+			return text
+		}
+		if attempt < maxRetries-1 {
+			time.Sleep(50 * time.Millisecond)
+			continue
+		}
+		log.Printf("Clipboard access failed: %v", err)
+	}
+	return ""
+}
+
+func (c *ClipboardSync) safeRead() string {
+	data, err := os.ReadFile(c.filePath)
 	if err != nil {
 		return ""
 	}
 	return string(data)
 }
 
-func (cs *ClipboardSync) checkConflicts() {
-	matches, err := filepath.Glob(filepath.Join(cs.dirPath, cs.globPattern))
+func (c *ClipboardSync) checkConflicts() {
+	matches, err := filepath.Glob(c.globPattern)
 	if err != nil {
 		return
 	}
-	var conflicts []string
-	for _, m := range matches {
-		if m == cs.filePath {
-			continue
-		}
-		if info, err := os.Stat(m); err == nil && !info.IsDir() {
-			conflicts = append(conflicts, filepath.Base(m))
+
+	var conflictFiles []string
+	for _, match := range matches {
+		info, err := os.Stat(match)
+		if err == nil && !info.IsDir() && match != c.filePath {
+			conflictFiles = append(conflictFiles, filepath.Base(match))
 		}
 	}
-	if len(conflicts) > 0 {
-		log.Printf("WARNING: Potential conflict files detected: %v", conflicts)
-	}
-}
 
-// ---------------------------------------------------------------------------
-// Clipboard -> File  (event-driven via clipboard.Watch)
-// ---------------------------------------------------------------------------
-
-// watchClipboard runs in its own goroutine. It receives clipboard change
-// events from the library and writes new content to the file, unless the
-// content originated from the file watcher (echo suppression).
-func (cs *ClipboardSync) watchClipboard(ctx context.Context) {
-	ch := clipboard.Watch(ctx, clipboard.FmtText)
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case data, ok := <-ch:
-			if !ok {
-				return
-			}
-			text := string(data)
-
-			// Suppress echo: this change was triggered by us writing to the
-			// clipboard from the file watcher — do not write it back to the file.
-			if text == cs.lastFileContent {
-				log.Printf("Clipboard echo suppressed (%d chars)", len(text))
-				continue
-			}
-
-			log.Printf("Clipboard -> File (%d chars)", len(text))
-			if err := os.WriteFile(cs.filePath, data, 0644); err != nil {
-				log.Printf("ERROR: Write to file failed: %v", err)
-				continue
-			}
-			// Update caches so the file watcher does not re-read what we just wrote.
-			cs.lastFileContent = text
-			cs.lastMtime = cs.getMtime()
-		}
+	if len(conflictFiles) > 0 {
+		log.Printf("Potential conflict files detected: %v", conflictFiles)
 	}
 }
 
-// ---------------------------------------------------------------------------
-// File -> Clipboard  (polling via ticker, mtime-gated)
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// State machine
+// ------------------------------------------------------------------
 
-// watchFile runs in its own goroutine. It polls the file's mtime and copies
-// new content to the clipboard when the file changes externally.
-func (cs *ClipboardSync) watchFile(ctx context.Context, interval time.Duration) {
-	ticker := time.NewTicker(interval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			cs.checkConflicts()
-
-			// File existence check.
-			if _, err := os.Stat(cs.filePath); os.IsNotExist(err) {
-				log.Printf("File %s vanished (syncing?), waiting...", cs.filePath)
-				continue
-			}
-
-			currentMtime := cs.getMtime()
-			if time.Time.Equal(currentMtime, cs.lastMtime) {
-				continue
-			}
-			cs.lastMtime = currentMtime
-
-			// Single read — consistent size + content, no TOCTOU race.
-			content := cs.safeRead()
-			if content == "" {
-				log.Printf("File %s is empty (cloud sync lock?), waiting...", cs.filePath)
-				continue
-			}
-			if content == cs.lastFileContent {
-				log.Printf("File %s mtime changed but content is unchanged.", cs.filePath)
-				continue
-			}
-
-			log.Printf("File -> Clipboard (%d chars)", len(content))
-			// Update lastFileContent BEFORE writing to clipboard so that
-			// watchClipboard's echo-suppression check sees the new value
-			// by the time the Watch event fires.
-			cs.lastFileContent = content
-			clipboard.Write(clipboard.FmtText, []byte(content))
-			cs.showNotification("Synced to Clipboard", compactMessage(content, 64))
+func (c *ClipboardSync) transition(state State) State {
+	switch state {
+	case Waiting:
+		// 1. Check clipboard change
+		currentClip := c.safePaste()
+		if currentClip != c.lastClip {
+			c.lastClip = currentClip
+			return WritingClipToFile
 		}
+
+		// 2. File existence check
+		if _, err := os.Stat(c.filePath); os.IsNotExist(err) {
+			log.Printf("File %s vanished (syncing?), waiting...", c.filePath)
+			return Waiting
+		}
+
+		// 3. Conflict detection
+		c.checkConflicts()
+
+		// 4. Check file change by mtime
+		currentMTime := c.getMTime()
+		if currentMTime.Equal(c.lastMTime) {
+			return Waiting
+		}
+		c.lastMTime = currentMTime
+
+		// Single read — avoids TOCTOU race between size check and content read
+		currentFileContent := c.safeRead()
+		if currentFileContent == "" {
+			log.Printf("File %s is empty (cloud sync lock?), waiting...", c.filePath)
+			return Waiting
+		}
+
+		if currentFileContent != c.lastFileContent {
+			c.lastFileContent = currentFileContent
+			return CopyingFileToClip
+		}
+
+		log.Printf("File %s mtime changed but content is unchanged.", c.filePath)
+		return Waiting
+
+	case WritingClipToFile:
+		log.Printf("Clipboard -> File (%d chars)", len([]rune(c.lastClip)))
+		err := os.WriteFile(c.filePath, []byte(c.lastClip), 0644)
+		if err != nil {
+			log.Printf("Write failed: %v", err)
+		} else {
+			// Update caches immediately to suppress self-triggered file-change detection
+			c.lastFileContent = c.lastClip
+			c.lastMTime = c.getMTime()
+		}
+		return Waiting
+
+	case CopyingFileToClip:
+		log.Printf("File -> Clipboard (%d chars)", len([]rune(c.lastFileContent)))
+		err := clipboard.WriteAll(c.lastFileContent)
+		if err != nil {
+			log.Printf("Copy failed: %v", err)
+		} else {
+			// Update cache before notification (non-blocking) to prevent echo
+			c.lastClip = c.lastFileContent
+			c.showNotification("Synced to Clipboard", compactMessage(c.lastFileContent, 64))
+		}
+		return Waiting
 	}
+
+	return Waiting
 }
 
-// ---------------------------------------------------------------------------
-// main
-// ---------------------------------------------------------------------------
+// ------------------------------------------------------------------
+// Entry point
+// ------------------------------------------------------------------
 
 func main() {
+	// Setup standard logging format to match Python
 	log.SetFlags(log.Ldate | log.Ltime)
 
-	filePath := flag.String("file-path", "./sync_clipboard.txt", "Path to the file used for syncing")
-	flag.StringVar(filePath, "f", "./sync_clipboard.txt", "Path to the file used for syncing (shorthand)")
+	filePathPtr := flag.String("f", "./sync_clipboard.txt", "Path to the file used for syncing")
+	flag.StringVar(filePathPtr, "file-path", "./sync_clipboard.txt", "Path to the file used for syncing")
 
-	interval := flag.Float64("interval", 0.5, "File polling interval in seconds")
-	flag.Float64Var(interval, "i", 0.5, "File polling interval in seconds (shorthand)")
+	intervalPtr := flag.Float64("i", 0.5, "Polling interval in seconds")
+	flag.Float64Var(intervalPtr, "interval", 0.5, "Polling interval in seconds")
 
-	noNotify := flag.Bool("no-notify", false, "Disable desktop notifications")
-
-	printVersion := flag.Bool("version", false, "Print version and exit")
-	flag.BoolVar(printVersion, "v", false, "Print version and exit (shorthand)")
+	noNotifyPtr := flag.Bool("no-notify", false, "Disable desktop notifications")
+	showVersion := flag.Bool("v", false, "Show version and exit")
+	flag.BoolVar(showVersion, "version", false, "Show version and exit")
 
 	flag.Parse()
 
-	if *printVersion {
-		fmt.Printf("clipsyncer %s\n", version)
+	if *showVersion {
+		fmt.Printf("ClipboardSync v%s\n", version)
 		os.Exit(0)
 	}
 
-	// Initialize the clipboard library (required by golang.design/x/clipboard).
-	if err := clipboard.Init(); err != nil {
-		log.Fatalf("CRITICAL: clipboard.Init() failed: %v", err)
-	}
+	absPath, _ := filepath.Abs(*filePathPtr)
+	log.Printf("Sync (v%s) starting — interval: %.2fs, file: %s. Press Ctrl+C to stop.", version, *intervalPtr, absPath)
 
-	absPath, err := filepath.Abs(*filePath)
+	syncer, err := NewClipboardSync(absPath, !*noNotifyPtr)
 	if err != nil {
-		log.Fatalf("CRITICAL: Could not resolve path: %v", err)
+		log.Fatalf("Failed to initialize syncer: %v", err)
 	}
 
-	log.Printf("Sync (v%s) starting — clipboard: event-driven, file poll: %.2fs, file: %s. Press Ctrl+C to stop.",
-		version, *interval, absPath)
+	// Graceful shutdown on SIGTERM and SIGINT (Ctrl+C)
+	sigs := make(chan os.Signal, 1)
+	signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
-	syncer, err := NewClipboardSync(absPath, !*noNotify)
-	if err != nil {
-		log.Fatalf("CRITICAL: %v", err)
-	}
-
-	// Cancelable context — cancelled on SIGINT / SIGTERM.
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-
-	sigChan := make(chan os.Signal, 1)
-	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 	go func() {
-		sig := <-sigChan
-		log.Printf("Received %s. Stopping...", sig)
-		cancel()
+		<-sigs
+		log.Println("Stopped.")
+		os.Exit(0)
 	}()
 
-	// Start both watchers concurrently.
-	go syncer.watchClipboard(ctx)
-	syncer.watchFile(ctx, time.Duration(*interval*float64(time.Second)))
+	intervalDuration := time.Duration(*intervalPtr * float64(time.Second))
+	state := Waiting
 
-	log.Println("Stopped.")
+	// Polling loop
+	for {
+		tStart := time.Now()
+		state = syncer.transition(state)
+		elapsed := time.Since(tStart)
+
+		sleepFor := intervalDuration - elapsed
+		if sleepFor > 0 {
+			time.Sleep(sleepFor)
+		}
+	}
 }
