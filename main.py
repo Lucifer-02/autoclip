@@ -1,5 +1,6 @@
 import argparse
 import logging
+import os
 import signal
 import sys
 import threading
@@ -10,7 +11,15 @@ from pathlib import Path
 import pyperclip
 from plyer import notification
 
-__version__ = "0.3.0"
+__version__ = "0.4.0"
+
+# Cap how much clipboard/file content we are willing to sync, to protect disk,
+# network and the OS from huge payloads (e.g. an image read back as a big blob).
+MAX_CONTENT_BYTES = 5 * 1024 * 1024  # 5 MiB
+
+# Smallest polling interval we accept. Anything lower turns the loop into a
+# busy-wait that hammers the clipboard backend and pins the CPU.
+MIN_INTERVAL = 0.05
 
 
 class State(Enum):
@@ -30,10 +39,16 @@ def compact_message(content: str, limit: int = 64) -> str:
 
 
 class ClipboardSync:
-    def __init__(self, file_path: Path, enable_notifications: bool = True):
+    def __init__(
+        self,
+        file_path: Path,
+        enable_notifications: bool = True,
+        hide_notification_content: bool = False,
+    ):
         # Resolve symlinks for consistent path comparison
         self.file_path = file_path.resolve()
         self.enable_notifications = enable_notifications
+        self.hide_notification_content = hide_notification_content
 
         # Cache glob pattern components to avoid recomputing every cycle
         self._dir = self.file_path.parent
@@ -48,7 +63,7 @@ class ClipboardSync:
                 raise
 
         # Initialize caches
-        self.last_clip: str = self._safe_paste()
+        self.last_clip, _ = self._safe_paste()
         self.last_mtime: float = self._get_mtime()
         self.last_file_content: str = self._safe_read()
 
@@ -79,12 +94,18 @@ class ClipboardSync:
         except OSError:
             return 0.0
 
-    def _safe_paste(self) -> str:
-        """Read clipboard with retries. Returns '' on persistent failure."""
+    def _safe_paste(self) -> tuple[str, bool]:
+        """Read clipboard with retries.
+
+        Returns ``(text, ok)``. Callers MUST distinguish a genuinely empty
+        clipboard (``("", True)``) from a failed read (``("", False)``): treating
+        a failed read as an empty clipboard would overwrite the synced file with
+        an empty string and wipe content on every other machine.
+        """
         max_retries = 3
         for attempt in range(max_retries):
             try:
-                return pyperclip.paste() or ""
+                return (pyperclip.paste() or ""), True
             except Exception as e:
                 if attempt < max_retries - 1:
                     time.sleep(0.05)
@@ -93,9 +114,9 @@ class ClipboardSync:
                 if "completed successfully" in error_msg:
                     logging.debug(f"Clipboard locked by another app: {error_msg}")
                 else:
-                    logging.warning(f"Clipboard access failed: {error_msg}")
-        # Return empty string rather than stale content on persistent failure
-        return ""
+                    logging.debug(f"Clipboard access failed: {error_msg}")
+        # Signal failure rather than returning a stale/empty value as if it were real.
+        return "", False
 
     def _safe_read(self) -> str:
         """Read file as UTF-8 text. Returns '' on any error.
@@ -107,6 +128,26 @@ class ClipboardSync:
             return self.file_path.read_text(encoding="utf-8")
         except Exception:
             return ""
+
+    def _atomic_write(self, content: str) -> None:
+        """Write content via a temp file + atomic rename.
+
+        ``os.replace`` is atomic on the same filesystem, so a cloud sync tool
+        watching the file never observes a half-written or truncated state. The
+        temp name is hidden and does not share the watched file's prefix, so it
+        is neither flagged as a conflict file nor matched by the rclone filter.
+        """
+        tmp = self._dir / f".{self.file_path.name}.tmp"
+        try:
+            tmp.write_text(content, encoding="utf-8")
+            os.replace(tmp, self.file_path)
+        except OSError:
+            # Best-effort cleanup of a leftover temp file, then re-raise.
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
+            raise
 
     def _check_conflicts(self) -> None:
         """Log any conflict/duplicate files created by sync tools."""
@@ -128,9 +169,10 @@ class ClipboardSync:
         """Advance the state machine by one step."""
 
         if state == State.WAITING:
-            # 1. Check clipboard change
-            current_clip = self._safe_paste()
-            if current_clip != self.last_clip:
+            # 1. Check clipboard change. Ignore failed reads (ok is False) so a
+            # transient clipboard error is never propagated as an empty write.
+            current_clip, ok = self._safe_paste()
+            if ok and current_clip != self.last_clip:
                 self.last_clip = current_clip
                 return State.WRITING_CLIP_TO_FILE
 
@@ -158,6 +200,14 @@ class ClipboardSync:
                 return State.WAITING
 
             if current_file_content != self.last_file_content:
+                if len(current_file_content.encode("utf-8")) > MAX_CONTENT_BYTES:
+                    logging.warning(
+                        f"File content exceeds {MAX_CONTENT_BYTES}-byte limit, "
+                        "skipping clipboard copy."
+                    )
+                    # Remember it to avoid repeating the warning every cycle.
+                    self.last_file_content = current_file_content
+                    return State.WAITING
                 self.last_file_content = current_file_content
                 return State.COPYING_FILE_TO_CLIP
 
@@ -167,9 +217,15 @@ class ClipboardSync:
             return State.WAITING
 
         if state == State.WRITING_CLIP_TO_FILE:
+            if len(self.last_clip.encode("utf-8")) > MAX_CONTENT_BYTES:
+                logging.warning(
+                    f"Clipboard content exceeds {MAX_CONTENT_BYTES}-byte limit, "
+                    "skipping file write."
+                )
+                return State.WAITING
             logging.info(f"Clipboard -> File ({len(self.last_clip)} chars)")
             try:
-                self.file_path.write_text(self.last_clip, encoding="utf-8")
+                self._atomic_write(self.last_clip)
                 # Update caches immediately to suppress self-triggered file-change detection
                 self.last_file_content = self.last_clip
                 self.last_mtime = self._get_mtime()
@@ -183,9 +239,15 @@ class ClipboardSync:
                 pyperclip.copy(self.last_file_content)
                 # Update cache before notification (non-blocking) to prevent echo
                 self.last_clip = self.last_file_content
+
+                notify_msg = (
+                    "***"
+                    if self.hide_notification_content
+                    else compact_message(self.last_file_content)
+                )
                 self._show_notification(
                     title="Synced to Clipboard",
-                    message=compact_message(self.last_file_content),
+                    message=notify_msg,
                     timeout=1,
                 )
             except Exception as e:
@@ -209,14 +271,12 @@ def main() -> None:
 
     parser = argparse.ArgumentParser(description="Bidirectional Clipboard Sync")
     parser.add_argument(
-        "-f",
         "--file-path",
         type=Path,
         default=Path("./sync_clipboard.txt"),
         help="Path to the file used for syncing",
     )
     parser.add_argument(
-        "-i",
         "--interval",
         type=float,
         default=0.5,
@@ -228,12 +288,22 @@ def main() -> None:
         help="Disable desktop notifications",
     )
     parser.add_argument(
-        "-v",
+        "--hide-notify-content",
+        action="store_true",
+        help="Hide clipboard content in desktop notifications",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
     args = parser.parse_args()
+
+    if args.interval < MIN_INTERVAL:
+        logging.warning(
+            f"Interval {args.interval}s is too small, clamping to {MIN_INTERVAL}s."
+        )
+        args.interval = MIN_INTERVAL
 
     sync_file = args.file_path.resolve()
     logging.info(
@@ -241,7 +311,11 @@ def main() -> None:
         f"file: {sync_file}. Press Ctrl+C to stop."
     )
 
-    syncer = ClipboardSync(file_path=sync_file, enable_notifications=not args.no_notify)
+    syncer = ClipboardSync(
+        file_path=sync_file,
+        enable_notifications=not args.no_notify,
+        hide_notification_content=args.hide_notify_content,
+    )
 
     # Graceful shutdown on SIGTERM (Ctrl+C is handled by KeyboardInterrupt below)
     def _handle_sigterm(signum, frame):
@@ -265,4 +339,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-

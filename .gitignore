@@ -218,3 +218,4 @@ __marimo__/
 *.exe
 clipsync
 sync_clipboard_dir/*
+clipsync_amd64_linux
