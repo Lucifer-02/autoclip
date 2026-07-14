@@ -15,7 +15,7 @@ import (
 	"github.com/gen2brain/beeep"
 )
 
-const Version = "0.4.0"
+const Version = "0.4.1"
 
 // maxContentBytes caps how much clipboard/file content we are willing to sync.
 // This protects disk, network and the OS from huge payloads (e.g. when an image
@@ -171,7 +171,13 @@ func (c *ClipboardSync) safePaste() (string, bool) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		slog.Debug("Clipboard access failed", "err", err)
+		// On Windows, a clipboard held open by another app fails with a bogus
+		// "The operation completed successfully." error (GetLastError == 0).
+		if strings.Contains(err.Error(), "completed successfully") {
+			slog.Debug("Clipboard locked by another app", "err", err)
+		} else {
+			slog.Debug("Clipboard access failed", "err", err)
+		}
 	}
 	return "", false
 }
