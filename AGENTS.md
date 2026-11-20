@@ -3,8 +3,8 @@
 **autoclip** / **clipsync** — bidirectional clipboard sync bridging the system clipboard and a plain text file (`sync_clipboard.txt`) so cloud sync tools (e.g. `rclone`) can relay it across machines.
 
 ## Layout
-- `main.py` / `test_main.py` — Python implementation (`uv`, Python >=3.14, `pyperclip`, `plyer`).
-- `go/clipsync/` — parallel Go implementation (`atotto/clipboard`, `gen2brain/beeep`); `make build` compiles local binaries and updates `./clipsync_amd64_linux`.
+- `go/clipsync/` — **production** Go implementation ported from the Python prototype (`atotto/clipboard`, `gen2brain/beeep`); `make build` compiles local binaries and updates `./clipsync_amd64_linux`.
+- `main.py` / `test_main.py` — **prototype** Python implementation (`uv`, Python >=3.14, `pyperclip`, `plyer`).
 - `bisync.sh` / `bisync_v2.sh` — `rclone bisync` bridges restricted to `/sync_clipboard.txt` (fixed poll vs. `inotifywait` directory watch + `stat` debounce).
 
 ## Commands

@@ -13,7 +13,6 @@ from enum import Enum, auto
 from pathlib import Path
 
 import pyperclip
-from plyer import notification
 
 __version__ = "0.5.0"
 
@@ -89,7 +88,7 @@ class ClipboardSync:
         *,
         paste_fn: Callable[[], str | None] = pyperclip.paste,
         copy_fn: Callable[[str], None] = pyperclip.copy,
-        notify_fn: Callable[..., None] = notification.notify,
+        notify_fn: Callable[..., None] | None = None,
     ) -> None:
         self.file_path = file_path.resolve()
         self.enable_notifications = enable_notifications
@@ -99,13 +98,19 @@ class ClipboardSync:
 
         self._paste_fn = paste_fn
         self._copy_fn = copy_fn
-        self._notify_fn = notify_fn
+        self._notify_fn: Callable[..., None] | None = notify_fn
 
         self._ensure_file_exists()
 
         # Single bounded worker thread prevents unbounded threads if notifications hang.
+        # Lazy-import plyer only when notifications are enabled so --help/--version/--no-notify
+        # stay silent on headless or non-dbus Linux setups.
         self._notify_queue: queue.Queue[tuple[str, str, int]] = queue.Queue(maxsize=1)
         if self.enable_notifications:
+            if self._notify_fn is None:
+                from plyer import notification
+
+                self._notify_fn = notification.notify
             threading.Thread(target=self._notification_worker, daemon=True).start()
 
         # Sync caches (updated only after reads/writes succeed).
@@ -140,8 +145,6 @@ class ClipboardSync:
                 if not too_large:
                     self.last_file_content = content
 
-        logger.info("Sync initialized on: %s", self.file_path)
-
     # ------------------------------------------------------------------
     # Low-level I/O helpers (preserve exact bytes, never alter content)
     # ------------------------------------------------------------------
@@ -168,6 +171,8 @@ class ClipboardSync:
     def _notification_worker(self) -> None:
         while True:
             title, message, timeout = self._notify_queue.get()
+            if self._notify_fn is None:
+                continue
             try:
                 self._notify_fn(title=title, message=message, timeout=timeout)
             except Exception as e:  # noqa: BLE001 — plyer backends raise varied OS/DBus errors
@@ -449,18 +454,25 @@ class ClipboardSync:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Bidirectional Clipboard Sync")
+    parser = argparse.ArgumentParser(
+        prog="clipsync",
+        description=(
+            "Bidirectional plain-text (UTF-8) clipboard sync bridging the system "
+            "clipboard and a local text file."
+        ),
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
     parser.add_argument(
         "--file-path",
         type=Path,
         default=Path("./sync_clipboard.txt"),
-        help="Path to the file used for syncing",
+        help="Path to the synced text file",
     )
     parser.add_argument(
         "--interval",
         type=float,
         default=DEFAULT_INTERVAL,
-        help="Polling interval in seconds",
+        help=f"Polling interval in seconds ({MIN_INTERVAL}..{int(MAX_INTERVAL)})",
     )
     parser.add_argument(
         "--no-notify",
@@ -470,18 +482,18 @@ def main() -> None:
     parser.add_argument(
         "--hide-notify-content",
         action="store_true",
-        help="Hide clipboard content in desktop notifications",
+        help="Mask clipboard content as '***' in notifications",
     )
     parser.add_argument(
         "--log-level",
         type=str,
         default="info",
-        help="Log verbosity: debug, info, warn or error",
+        help="Log verbosity: debug, info, warn, or error",
     )
     parser.add_argument(
         "--version",
         action="version",
-        version=f"%(prog)s {__version__}",
+        version=f"clipsync {__version__}",
     )
     args = parser.parse_args()
 
@@ -500,17 +512,19 @@ def main() -> None:
 
     args.interval = validate_interval(args.interval)
     sync_file = args.file_path.resolve()
-    logger.info(
-        "Sync (v%s) starting — interval: %ss, file: %s. Press Ctrl+C to stop.",
-        __version__,
-        args.interval,
-        sync_file,
-    )
 
     syncer = ClipboardSync(
         file_path=sync_file,
         enable_notifications=not args.no_notify,
         hide_notification_content=args.hide_notify_content,
+    )
+
+    logger.info(
+        "Sync started (v%s) — file: %s, interval: %ss, notify: %s. Press Ctrl+C to stop.",
+        __version__,
+        syncer.file_path,
+        args.interval,
+        "off" if args.no_notify else "on",
     )
 
     stop_event = threading.Event()

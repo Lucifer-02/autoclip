@@ -8,7 +8,7 @@ import types
 import unittest
 from pathlib import Path
 
-# Allow running tests with stdlib python3 when pyperclip/plyer are only in .venv.
+# Allow running tests with stdlib python3 when pyperclip is only in .venv.
 if importlib.util.find_spec("pyperclip") is None:
 
     class _FakePyperclip(types.ModuleType):
@@ -21,13 +21,6 @@ if importlib.util.find_spec("pyperclip") is None:
             return None
 
     sys.modules["pyperclip"] = _FakePyperclip("pyperclip")
-
-if importlib.util.find_spec("plyer") is None:
-
-    class _FakePlyer(types.ModuleType):
-        notification = types.SimpleNamespace(notify=lambda **_kwargs: None)
-
-    sys.modules["plyer"] = _FakePlyer("plyer")
 
 import main as autoclip
 

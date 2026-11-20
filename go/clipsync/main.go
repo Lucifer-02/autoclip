@@ -217,7 +217,6 @@ func newClipboardSync(path string, enableNotifications, hideNotificationContent 
 		}
 	}
 
-	slog.Info("Sync initialized", "file", c.filePath)
 	return c, nil
 }
 
@@ -561,16 +560,30 @@ func (c *ClipboardSync) copyFileToClip() State {
 // ------------------------------------------------------------------
 
 func main() {
-	filePath := flag.String("file-path", "./sync_clipboard.txt", "Path to the file used for syncing")
-	interval := flag.Float64("interval", defaultInterval, "Polling interval in seconds")
+	filePath := flag.String("file-path", "./sync_clipboard.txt", "Path to the synced text file")
+	interval := flag.Float64("interval", defaultInterval, fmt.Sprintf("Polling interval in seconds (%.2f..%.0f)", minInterval, maxInterval))
 	noNotify := flag.Bool("no-notify", false, "Disable desktop notifications")
-	hideNotifyContent := flag.Bool("hide-notify-content", false, "Hide clipboard content in desktop notifications")
-	logLevelFlag := flag.String("log-level", "info", "Log verbosity: debug, info, warn or error")
-	versionFlag := flag.Bool("version", false, "Show version")
+	hideNotifyContent := flag.Bool("hide-notify-content", false, "Mask clipboard content as '***' in notifications")
+	logLevelFlag := flag.String("log-level", "info", "Log verbosity: debug, info, warn, or error")
+	versionFlag := flag.Bool("version", false, "Show version and exit")
+
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintf(out, "clipsync %s — bidirectional plain-text (UTF-8) clipboard sync.\n\n", Version)
+		fmt.Fprintf(out, "Usage: %s [options]\n\nOptions:\n", filepath.Base(os.Args[0]))
+		flag.PrintDefaults()
+	}
+
 	flag.Parse()
 
+	if flag.NArg() > 0 {
+		fmt.Fprintf(os.Stderr, "Error: unexpected arguments: %s\n\n", strings.Join(flag.Args(), " "))
+		flag.Usage()
+		os.Exit(2)
+	}
+
 	if *versionFlag {
-		fmt.Printf("clipboard-sync %s\n", Version)
+		fmt.Printf("clipsync %s\n", Version)
 		os.Exit(0)
 	}
 
@@ -588,13 +601,13 @@ func main() {
 		os.Exit(1)
 	}
 
-	slog.Info("Sync starting", "version", Version, "interval", *interval, "file", syncFile)
-
 	syncer, err := NewClipboardSync(syncFile, !*noNotify, *hideNotifyContent)
 	if err != nil {
 		slog.Error("Initialization failed", "err", err)
 		os.Exit(1)
 	}
+
+	slog.Info("Sync started", "version", Version, "file", syncer.filePath, "interval", *interval, "notify", !*noNotify)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
