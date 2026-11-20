@@ -1,10 +1,20 @@
 # autoclip / clipsync
 
-Lightweight bidirectional clipboard sync that bridges your system clipboard and a plain text file (`sync_clipboard.txt`), letting cloud sync tools like `rclone` relay clipboard content across Linux, macOS, and Windows.
+Cross-platform bidirectional clipboard sync for **Linux, macOS, and Windows**. It bridges your system clipboard and a plain text file (`sync_clipboard.txt`), letting any cloud sync tool (`rclone`, Syncthing, Dropbox, Google Drive, OneDrive, iCloud Drive, etc.) relay clipboard text seamlessly across machines and operating systems.
 
 Ships with two feature-equivalent implementations:
-- **Python** (`main.py`) — managed with `uv` (Python >=3.14, `pyperclip`, `plyer`)
-- **Go** (`go/clipsync/`) — single static binary (`atotto/clipboard`, `gen2brain/beeep`)
+- **Python** (`main.py`) — runs on Linux, macOS, and Windows via `uv` (Python >=3.14, `pyperclip`, `plyer`)
+- **Go** (`go/clipsync/`) — compiles to standalone native binaries for Linux, macOS (Apple Silicon / Intel), and Windows (`atotto/clipboard`, `gen2brain/beeep`)
+
+## Cross-Platform Support
+
+| Platform | Go Binary (`make build`) | Python (`uv run main.py`) | Requirements / Notes |
+| --- | --- | --- | --- |
+| **Linux** | `clipsync_amd64_linux` | Supported | Requires `xclip` or `xsel` for clipboard access; `inotify-tools` optional for `bisync_v2.sh` |
+| **macOS** | `clipsync_arm64_macos` | Supported | Uses built-in `pbcopy` / `pbpaste` (no extra clipboard deps) |
+| **Windows** | `clipsync_amd64_windows.exe` | Supported | Native Win32 clipboard & toast notifications; retries transient clipboard/file locks |
+
+> Mix and match freely — e.g. run the Go binary on Windows/macOS and Python (or Go) on Linux against the same synced `sync_clipboard.txt`. Exact UTF-8 bytes and line endings (`\r\n` / `\n`) are preserved across platforms.
 
 ## Features
 - **Verbatim UTF-8 sync** — preserves exact bytes, whitespace, and line endings (`\r\n` / `\n`) without modification.
@@ -14,25 +24,37 @@ Ships with two feature-equivalent implementations:
 
 ## Quick Start
 
-### Python
+### Python (Linux / macOS / Windows)
 ```bash
 uv sync
 uv run main.py
 ```
 
-### Go
+### Go (Linux / macOS / Windows)
+Build native binaries for all three platforms:
 ```bash
 cd go/clipsync && make build
-cd ../.. && ./clipsync_amd64_linux
+```
+
+Then run the binary for your OS:
+```bash
+# Linux
+./clipsync_amd64_linux
+
+# macOS (Apple Silicon)
+./go/clipsync/clipsync_arm64_macos
+
+# Windows (PowerShell / CMD)
+.\go\clipsync\clipsync_amd64_windows.exe
 ```
 
 ### Cloud Sync Bridge (`rclone`)
-Run alongside either implementation to sync `/sync_clipboard.txt` with a remote:
+Any file sync client works by syncing the folder containing `sync_clipboard.txt`. For `rclone`, two helper scripts restricted to `/sync_clipboard.txt` are included:
 ```bash
 # Event-driven (Linux, requires inotify-tools)
 DRIVE=myremote bash bisync_v2.sh
 
-# Simple fixed-interval polling
+# Portable fixed-interval polling (Linux / macOS / Git Bash on Windows)
 DRIVE=myremote bash bisync.sh
 ```
 
