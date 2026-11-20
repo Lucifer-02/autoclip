@@ -5,14 +5,14 @@
 ## Layout
 - `go/clipsync/` — **production** Go implementation ported from the Python prototype (`atotto/clipboard`, `gen2brain/beeep`); `make build` compiles local binaries and updates `./clipsync_amd64_linux`.
 - `main.py` / `test_main.py` — **prototype** Python implementation (`uv`, Python >=3.14, `pyperclip`, `plyer`).
-- `bisync.sh` / `bisync_v2.sh` — `rclone bisync` bridges restricted to `/sync_clipboard.txt` (fixed poll vs. `inotifywait` directory watch + `stat` debounce).
+- `bisync.sh` — `rclone bisync` polling bridge restricted to `/sync_clipboard.txt` (with error retry backoff).
 
 ## Commands
 ```bash
 # Run (shared flags: --file-path, --interval, --log-level debug|info|warn|error, --no-notify, --hide-notify-content, --version)
 uv run main.py
 ./clipsync_amd64_linux
-bash bisync_v2.sh
+bash bisync.sh
 
 # Build Go targets (macOS arm64, Windows amd64, Linux amd64 + atomic update of ./clipsync_amd64_linux)
 cd go/clipsync && make build

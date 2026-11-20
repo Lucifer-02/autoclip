@@ -25,8 +25,7 @@ uv sync && uv run main.py
 
 **Optional `rclone` sync bridge** (or use any file sync client on the folder):
 ```bash
-DRIVE=myremote bash bisync_v2.sh   # Linux (inotify-tools, event-driven)
-DRIVE=myremote bash bisync.sh      # Linux / macOS / Windows Git Bash (polling)
+DRIVE=myremote bash bisync.sh      # Linux / macOS / Windows Git Bash
 ```
 
 ## CLI Flags (Python & Go)
