@@ -1,12 +1,17 @@
 package main
 
 import (
+	"crypto/sha256"
 	"flag"
 	"fmt"
+	"io"
 	"log/slog"
+	"math"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"slices"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
@@ -15,35 +20,33 @@ import (
 	"github.com/gen2brain/beeep"
 )
 
-const Version = "0.4.1"
+const Version = "0.5.0"
 
-// maxContentBytes caps how much clipboard/file content we are willing to sync.
-// This protects disk, network and the OS from huge payloads (e.g. when an image
-// lands on the clipboard and is read back as a large blob).
-const maxContentBytes = 5 * 1024 * 1024 // 5 MiB
-
-// minInterval is the smallest polling interval we accept. Anything lower turns
-// the loop into a busy-wait that spawns clipboard subprocesses (xclip/xsel/etc.)
-// hundreds of times per second and pins the CPU.
-const minInterval = 0.05
+const (
+	maxContentBytes = 5 * 1024 * 1024 // 5 MiB
+	minInterval     = 0.05
+	maxInterval     = 3600.0
+	defaultInterval = 0.5
+	ioRetries       = 3
+	retryDelay      = 50 * time.Millisecond
+)
 
 // ------------------------------------------------------------------
-// Logging (log/slog)
+// Logging & CLI helpers
 // ------------------------------------------------------------------
 
-// parseLogLevel maps a flag string (case-insensitive) to a slog.Level. Unknown
-// values return an error so the caller can warn and fall back to the default.
 func parseLogLevel(s string) (slog.Level, error) {
+	key := strings.ToUpper(strings.TrimSpace(s))
+	if key == "WARNING" {
+		key = "WARN"
+	}
 	var lvl slog.Level
-	if err := lvl.UnmarshalText([]byte(strings.ToUpper(strings.TrimSpace(s)))); err != nil {
+	if err := lvl.UnmarshalText([]byte(key)); err != nil {
 		return slog.LevelInfo, fmt.Errorf("unknown log level %q (use debug, info, warn or error)", s)
 	}
 	return lvl, nil
 }
 
-// setupLogging installs a slog text handler on stderr that emits messages at or
-// above the given level. The timestamp is shortened to a time-only format to
-// keep the console output compact for an interactive CLI.
 func setupLogging(level slog.Level) {
 	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{
 		Level: level,
@@ -57,7 +60,67 @@ func setupLogging(level slog.Level) {
 	slog.SetDefault(slog.New(handler))
 }
 
-// State represents the states of the sync machine
+func validateInterval(interval float64) float64 {
+	if math.IsNaN(interval) || math.IsInf(interval, 0) {
+		slog.Warn("Interval is not finite, using default", "requested", interval, "default", defaultInterval)
+		return defaultInterval
+	}
+	if interval < minInterval {
+		slog.Warn("Interval too small, clamping", "requested", interval, "min", minInterval)
+		return minInterval
+	}
+	if interval > maxInterval {
+		slog.Warn("Interval too large, clamping", "requested", interval, "max", maxInterval)
+		return maxInterval
+	}
+	return interval
+}
+
+// compactMessage formats a short preview for desktop notifications (never alters clipboard).
+func compactMessage(content string, limit int) string {
+	if content == "" || limit <= 0 {
+		return ""
+	}
+	preview := strings.NewReplacer("\r\n", " ", "\r", " ", "\n", " ").Replace(content)
+	preview = strings.TrimSpace(preview)
+	runes := []rune(preview)
+	if len(runes) <= limit {
+		return preview
+	}
+	if limit <= 3 {
+		return string(runes[:limit])
+	}
+	return string(runes[:limit-3]) + "..."
+}
+
+// resolveFilePath resolves symlinks (including dangling links and symlinked
+// parent dirs) so atomic renames never destroy a symlink.
+func resolveFilePath(path string) (string, error) {
+	absPath, err := filepath.Abs(path)
+	if err != nil {
+		return "", err
+	}
+	if resolved, err := filepath.EvalSymlinks(absPath); err == nil {
+		return resolved, nil
+	}
+	if info, err := os.Lstat(absPath); err == nil && info.Mode()&os.ModeSymlink != 0 {
+		if target, err := os.Readlink(absPath); err == nil {
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(absPath), target)
+			}
+			absPath = filepath.Clean(target)
+		}
+	}
+	if resolvedDir, err := filepath.EvalSymlinks(filepath.Dir(absPath)); err == nil {
+		return filepath.Join(resolvedDir, filepath.Base(absPath)), nil
+	}
+	return absPath, nil
+}
+
+// ------------------------------------------------------------------
+// State machine & ClipboardSync
+// ------------------------------------------------------------------
+
 type State int
 
 const (
@@ -66,113 +129,170 @@ const (
 	CopyingFileToClip
 )
 
-// compactMessage truncates string for cleaner log/notification output
-func compactMessage(content string, limit int) string {
-	if content == "" {
-		return ""
-	}
-	content = strings.TrimSpace(strings.ReplaceAll(content, "\n", " "))
-	runes := []rune(content)
-	if len(runes) > limit {
-		return string(runes[:limit-3]) + "..."
-	}
-	return content
+type notifyPayload struct {
+	title   string
+	message string
 }
 
-// ClipboardSync holds the state and configuration for the sync process
+type ioBackends struct {
+	readClip  func() (string, error)
+	writeClip func(string) error
+	notify    func(title, message string, icon any) error
+}
+
+func defaultBackends() ioBackends {
+	return ioBackends{
+		readClip:  clipboard.ReadAll,
+		writeClip: clipboard.WriteAll,
+		notify:    beeep.Notify,
+	}
+}
+
+// ClipboardSync bridges clipboard and file while preserving exact bytes verbatim.
 type ClipboardSync struct {
 	filePath                string
+	dir                     string
+	fileName                string
 	enableNotifications     bool
 	hideNotificationContent bool
-	dir                     string
-	globPattern             string
-	lastClip                string
-	lastMtime               time.Time
-	lastFileContent         string
+
+	io       ioBackends
+	notifyCh chan notifyPayload
+
+	// Sync caches (updated only after reads/writes succeed).
+	clipReady         bool
+	lastClip          string
+	oversizedClipHash [sha256.Size]byte
+	lastMtime         time.Time
+	lastFileContent   string
+
+	// Pending payloads waiting for the next state step.
+	pendingClip        string
+	pendingFileContent string
+	pendingMtime       time.Time
+
+	// Log/scan deduplication state.
+	lastDirMtime   time.Time
+	lastConflicts  []string
+	lastEmptyMtime time.Time
 }
 
-func NewClipboardSync(path string, enableNotifications bool, hideNotificationContent bool) (*ClipboardSync, error) {
-	absPath, err := filepath.Abs(path)
+func NewClipboardSync(path string, enableNotifications, hideNotificationContent bool) (*ClipboardSync, error) {
+	return newClipboardSync(path, enableNotifications, hideNotificationContent, defaultBackends())
+}
+
+func newClipboardSync(path string, enableNotifications, hideNotificationContent bool, io ioBackends) (*ClipboardSync, error) {
+	resolvedPath, err := resolveFilePath(path)
 	if err != nil {
 		return nil, err
 	}
+	if err := ensureFileExists(resolvedPath); err != nil {
+		return nil, err
+	}
 
-	dir := filepath.Dir(absPath)
-	fileName := filepath.Base(absPath)
+	c := &ClipboardSync{
+		filePath:                resolvedPath,
+		dir:                     filepath.Dir(resolvedPath),
+		fileName:                filepath.Base(resolvedPath),
+		enableNotifications:     enableNotifications,
+		hideNotificationContent: hideNotificationContent,
+		io:                      io,
+		notifyCh:                make(chan notifyPayload, 1),
+	}
 
-	// Ensure file exists
-	if _, err := os.Stat(absPath); os.IsNotExist(err) {
-		if err := os.WriteFile(absPath, []byte(""), 0644); err != nil {
-			return nil, fmt.Errorf("could not create file %s: %v", absPath, err)
+	if enableNotifications {
+		go c.notificationWorker()
+	}
+
+	// Seed initial caches without modifying either clipboard or file.
+	if clip, ok := c.safePaste(); ok {
+		c.initClip(clip)
+	}
+	if mtime, exists := c.getMtime(); exists {
+		if content, readOK, tooLarge := c.safeRead(); readOK {
+			c.lastMtime = mtime
+			if !tooLarge {
+				c.lastFileContent = content
+			}
 		}
 	}
 
-	sync := &ClipboardSync{
-		filePath:                absPath,
-		enableNotifications:     enableNotifications,
-		hideNotificationContent: hideNotificationContent,
-		dir:                     dir,
-		globPattern:             fileName + "*",
+	slog.Info("Sync initialized", "file", c.filePath)
+	return c, nil
+}
+
+func ensureFileExists(path string) error {
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		return nil
 	}
+	f, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY, 0600)
+	if err != nil {
+		return fmt.Errorf("could not create file %s: %w", path, err)
+	}
+	return f.Close()
+}
 
-	sync.lastClip, _ = sync.safePaste()
-	sync.lastMtime = sync.getMtime()
-	sync.lastFileContent = sync.safeRead()
-
-	slog.Info("Sync initialized", "file", sync.filePath)
-	return sync, nil
+func (c *ClipboardSync) initClip(clip string) {
+	if len(clip) > maxContentBytes {
+		c.oversizedClipHash = sha256.Sum256([]byte(clip))
+		c.lastClip = ""
+	} else {
+		c.lastClip = clip
+	}
+	c.clipReady = true
 }
 
 // ------------------------------------------------------------------
-// Helpers
+// Low-level I/O helpers (preserve exact bytes, never alter content)
 // ------------------------------------------------------------------
+
+func (c *ClipboardSync) notificationWorker() {
+	for p := range c.notifyCh {
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					slog.Warn("Notification panic recovered", "err", r)
+				}
+			}()
+			if err := c.io.notify(p.title, p.message, ""); err != nil {
+				slog.Warn("Notification failed", "err", err)
+			}
+		}()
+	}
+}
 
 func (c *ClipboardSync) showNotification(title, message string) {
 	if !c.enableNotifications {
 		return
 	}
-	// Run in a goroutine to avoid blocking the loop. Recover from panics inside
-	// the notification backend so a flaky desktop environment can never crash
-	// the whole sync daemon.
-	go func() {
-		defer func() {
-			if r := recover(); r != nil {
-				slog.Warn("Notification panic recovered", "err", r)
-			}
-		}()
-		// beeep doesn't natively support custom timeouts, OS handles it
-		if err := beeep.Notify(title, message, ""); err != nil {
-			slog.Warn("Notification failed", "err", err)
-		}
-	}()
+	select {
+	case <-c.notifyCh:
+	default:
+	}
+	select {
+	case c.notifyCh <- notifyPayload{title: title, message: message}:
+	default:
+	}
 }
 
-func (c *ClipboardSync) getMtime() time.Time {
+func (c *ClipboardSync) getMtime() (time.Time, bool) {
 	info, err := os.Stat(c.filePath)
 	if err != nil {
-		return time.Time{} // Returns zero value if error
+		return time.Time{}, false
 	}
-	return info.ModTime()
+	return info.ModTime(), true
 }
 
-// safePaste reads the clipboard with retries. The second return value reports
-// whether the read actually succeeded: callers MUST distinguish a real empty
-// clipboard (text == "", ok == true) from a failed read (ok == false), because
-// treating a failed read as an empty clipboard would overwrite the synced file
-// with an empty string and wipe content on every other machine.
 func (c *ClipboardSync) safePaste() (string, bool) {
-	maxRetries := 3
-	for attempt := 0; attempt < maxRetries; attempt++ {
-		text, err := clipboard.ReadAll()
+	for attempt := 0; attempt < ioRetries; attempt++ {
+		text, err := c.io.readClip()
 		if err == nil {
 			return text, true
 		}
-		if attempt < maxRetries-1 {
-			time.Sleep(50 * time.Millisecond)
+		if attempt < ioRetries-1 {
+			time.Sleep(retryDelay)
 			continue
 		}
-		// On Windows, a clipboard held open by another app fails with a bogus
-		// "The operation completed successfully." error (GetLastError == 0).
 		if strings.Contains(err.Error(), "completed successfully") {
 			slog.Debug("Clipboard locked by another app", "err", err)
 		} else {
@@ -182,137 +302,257 @@ func (c *ClipboardSync) safePaste() (string, bool) {
 	return "", false
 }
 
-func (c *ClipboardSync) safeRead() string {
-	data, err := os.ReadFile(c.filePath)
-	if err != nil {
-		return ""
+func (c *ClipboardSync) safeCopy(content string) bool {
+	for attempt := 0; attempt < ioRetries; attempt++ {
+		err := c.io.writeClip(content)
+		if err == nil {
+			return true
+		}
+		if attempt < ioRetries-1 {
+			time.Sleep(retryDelay)
+			continue
+		}
+		slog.Error("Copy failed", "err", err)
 	}
-	return string(data)
+	return false
 }
 
-// atomicWrite writes content to a temp file in the same directory and renames
-// it onto the target. The rename is atomic on POSIX (and Windows), so a cloud
-// sync tool watching the file never observes a half-written or truncated state.
-// The temp name is hidden and does NOT share the watched file's prefix, so it is
-// neither flagged as a conflict file nor picked up by the rclone include filter.
-func (c *ClipboardSync) atomicWrite(content string) error {
-	tmp := filepath.Join(c.dir, "."+filepath.Base(c.filePath)+".tmp")
-	if err := os.WriteFile(tmp, []byte(content), 0644); err != nil {
-		return err
+// safeRead reads at most maxContentBytes+1 raw bytes in a single open/read pass.
+func (c *ClipboardSync) safeRead() (content string, ok bool, tooLarge bool) {
+	f, err := os.Open(c.filePath)
+	if err != nil {
+		slog.Debug("File read failed", "file", c.filePath, "err", err)
+		return "", false, false
 	}
-	if err := os.Rename(tmp, c.filePath); err != nil {
-		os.Remove(tmp) // best-effort cleanup; ignore error
-		return err
+	defer f.Close()
+
+	data, err := io.ReadAll(io.LimitReader(f, maxContentBytes+1))
+	if err != nil {
+		slog.Debug("File read failed", "file", c.filePath, "err", err)
+		return "", false, false
 	}
-	return nil
+	if len(data) > maxContentBytes {
+		return "", true, true
+	}
+	return string(data), true, false
+}
+
+// atomicWrite writes exact bytes via a unique 0600 temp file + atomic rename
+// and returns the temp file's mtime captured right before rename.
+func (c *ClipboardSync) atomicWrite(content string) (time.Time, error) {
+	f, err := os.CreateTemp(c.dir, "."+c.fileName+".*.tmp")
+	if err != nil {
+		return time.Time{}, err
+	}
+	tmp := f.Name()
+	cleanup := true
+	defer func() {
+		if cleanup {
+			_ = os.Remove(tmp)
+		}
+	}()
+
+	if _, err := f.WriteString(content); err != nil {
+		_ = f.Close()
+		return time.Time{}, err
+	}
+	if err := f.Close(); err != nil {
+		return time.Time{}, err
+	}
+	info, err := os.Stat(tmp)
+	if err != nil {
+		return time.Time{}, err
+	}
+
+	var renameErr error
+	for attempt := 0; attempt < ioRetries; attempt++ {
+		if renameErr = os.Rename(tmp, c.filePath); renameErr == nil {
+			cleanup = false
+			return info.ModTime(), nil
+		}
+		if attempt < ioRetries-1 {
+			time.Sleep(retryDelay)
+		}
+	}
+	return time.Time{}, renameErr
 }
 
 func (c *ClipboardSync) checkConflicts() {
-	pattern := filepath.Join(c.dir, c.globPattern)
-	matches, err := filepath.Glob(pattern)
+	dirInfo, err := os.Stat(c.dir)
+	if err != nil || dirInfo.ModTime().Equal(c.lastDirMtime) {
+		return
+	}
+	c.lastDirMtime = dirInfo.ModTime()
+
+	entries, err := os.ReadDir(c.dir)
 	if err != nil {
 		return
 	}
 
 	var conflicts []string
-	for _, match := range matches {
-		if match != c.filePath {
-			if info, err := os.Stat(match); err == nil && !info.IsDir() {
-				conflicts = append(conflicts, filepath.Base(match))
-			}
+	for _, entry := range entries {
+		name := entry.Name()
+		if name == c.fileName || !strings.HasPrefix(name, c.fileName) {
+			continue
+		}
+		if entry.Type().IsRegular() {
+			conflicts = append(conflicts, name)
+		} else if info, err := entry.Info(); err == nil && !info.IsDir() {
+			conflicts = append(conflicts, name)
 		}
 	}
+	sort.Strings(conflicts)
 
-	if len(conflicts) > 0 {
-		slog.Warn("Potential conflict files detected", "files", conflicts)
+	if !slices.Equal(conflicts, c.lastConflicts) {
+		c.lastConflicts = conflicts
+		if len(conflicts) > 0 {
+			slog.Warn("Potential conflict files detected", "files", conflicts)
+		} else {
+			slog.Info("Conflict files cleared")
+		}
 	}
 }
 
 // ------------------------------------------------------------------
-// State machine
+// State machine transitions
 // ------------------------------------------------------------------
 
 func (c *ClipboardSync) Transition(state State) State {
 	switch state {
 	case Waiting:
-		// 1. Check clipboard change. Ignore failed reads (ok == false) so a
-		// transient clipboard error can never be propagated as an empty write.
-		currentClip, ok := c.safePaste()
-		if ok && currentClip != c.lastClip {
-			c.lastClip = currentClip
-			return WritingClipToFile
-		}
-
-		// 2. File existence check
-		if _, err := os.Stat(c.filePath); os.IsNotExist(err) {
-			slog.Debug("File vanished (syncing?), waiting", "file", c.filePath)
-			return Waiting
-		}
-
-		// 3. Conflict detection
-		c.checkConflicts()
-
-		// 4. Check file change by mtime
-		currentMtime := c.getMtime()
-		if currentMtime.Equal(c.lastMtime) {
-			return Waiting
-		}
-
-		c.lastMtime = currentMtime
-
-		// Single read — avoids TOCTOU race
-		currentFileContent := c.safeRead()
-		if currentFileContent == "" {
-			slog.Debug("File is empty (cloud sync lock?), waiting", "file", c.filePath)
-			return Waiting
-		}
-
-		if currentFileContent != c.lastFileContent {
-			if len(currentFileContent) > maxContentBytes {
-				slog.Warn("File content exceeds size limit, skipping clipboard copy", "bytes", len(currentFileContent), "limit", maxContentBytes)
-				c.lastFileContent = currentFileContent // remember it to avoid repeating the warning
-				return Waiting
-			}
-			c.lastFileContent = currentFileContent
-			return CopyingFileToClip
-		}
-
-		slog.Debug("File mtime changed but content unchanged", "file", c.filePath)
-		return Waiting
-
+		return c.poll()
 	case WritingClipToFile:
-		if len(c.lastClip) > maxContentBytes {
-			slog.Warn("Clipboard content exceeds size limit, skipping file write", "bytes", len(c.lastClip), "limit", maxContentBytes)
-			return Waiting
-		}
-		slog.Info("Clipboard -> File", "chars", len([]rune(c.lastClip)))
-		err := c.atomicWrite(c.lastClip)
-		if err != nil {
-			slog.Error("Write failed", "err", err)
-		} else {
-			// Update caches immediately to suppress self-triggered file-change detection
-			c.lastFileContent = c.lastClip
-			c.lastMtime = c.getMtime()
-		}
-		return Waiting
-
+		return c.writeClipToFile()
 	case CopyingFileToClip:
-		slog.Info("File -> Clipboard", "chars", len([]rune(c.lastFileContent)))
-		err := clipboard.WriteAll(c.lastFileContent)
-		if err != nil {
-			slog.Error("Copy failed", "err", err)
-		} else {
-			// Update cache before notification to prevent echo
-			c.lastClip = c.lastFileContent
-			msg := compactMessage(c.lastFileContent, 64)
-			if c.hideNotificationContent {
-				msg = "***"
-			}
-			c.showNotification("Synced to Clipboard", msg)
+		return c.copyFileToClip()
+	default:
+		return Waiting
+	}
+}
+
+func (c *ClipboardSync) poll() State {
+	if next := c.checkClipboard(); next != Waiting {
+		return next
+	}
+	return c.checkFile()
+}
+
+func (c *ClipboardSync) checkClipboard() State {
+	currentClip, ok := c.safePaste()
+	if !ok {
+		return Waiting
+	}
+	if !c.clipReady {
+		c.initClip(currentClip)
+		return Waiting
+	}
+	if currentClip == c.lastClip {
+		return Waiting
+	}
+	if currentClip == "" {
+		slog.Debug("Clipboard is empty or non-text, skipping file write")
+		c.lastClip = ""
+		c.oversizedClipHash = [sha256.Size]byte{}
+		return Waiting
+	}
+	if len(currentClip) > maxContentBytes {
+		digest := sha256.Sum256([]byte(currentClip))
+		if digest != c.oversizedClipHash {
+			slog.Warn("Clipboard content exceeds size limit, skipping file write", "bytes", len(currentClip), "limit", maxContentBytes)
+			c.oversizedClipHash = digest
 		}
 		return Waiting
 	}
 
+	c.oversizedClipHash = [sha256.Size]byte{}
+	c.pendingClip = currentClip
+	return WritingClipToFile
+}
+
+func (c *ClipboardSync) checkFile() State {
+	currentMtime, exists := c.getMtime()
+	if !exists {
+		slog.Debug("File vanished (syncing?), waiting", "file", c.filePath)
+		return Waiting
+	}
+
+	c.checkConflicts()
+
+	if !c.lastMtime.IsZero() && currentMtime.Equal(c.lastMtime) {
+		return Waiting
+	}
+
+	content, readOK, tooLarge := c.safeRead()
+	if !readOK {
+		return Waiting
+	}
+	if tooLarge {
+		slog.Warn("File content exceeds size limit, skipping clipboard copy", "limit", maxContentBytes)
+		c.lastMtime = currentMtime
+		return Waiting
+	}
+	if content == "" {
+		if !currentMtime.Equal(c.lastEmptyMtime) {
+			slog.Debug("File is empty (cloud sync lock?), waiting", "file", c.filePath)
+			c.lastEmptyMtime = currentMtime
+		}
+		return Waiting
+	}
+	c.lastEmptyMtime = time.Time{}
+
+	if content != c.lastFileContent {
+		c.pendingFileContent = content
+		c.pendingMtime = currentMtime
+		return CopyingFileToClip
+	}
+
+	c.lastMtime = currentMtime
+	slog.Debug("File mtime changed but content unchanged", "file", c.filePath)
+	return Waiting
+}
+
+func (c *ClipboardSync) writeClipToFile() State {
+	content := c.pendingClip
+	c.pendingClip = ""
+	if content == "" {
+		return Waiting
+	}
+
+	slog.Info("Clipboard -> File", "chars", len([]rune(content)))
+	writtenMtime, err := c.atomicWrite(content)
+	if err != nil {
+		slog.Error("Write failed", "err", err)
+		return Waiting
+	}
+	c.lastClip = content
+	c.lastFileContent = content
+	c.lastMtime = writtenMtime
+	return Waiting
+}
+
+func (c *ClipboardSync) copyFileToClip() State {
+	content := c.pendingFileContent
+	mtime := c.pendingMtime
+	c.pendingFileContent = ""
+	c.pendingMtime = time.Time{}
+	if content == "" {
+		return Waiting
+	}
+
+	slog.Info("File -> Clipboard", "chars", len([]rune(content)))
+	if c.safeCopy(content) {
+		c.lastClip = content
+		c.clipReady = true
+		c.lastFileContent = content
+		c.lastMtime = mtime
+		c.oversizedClipHash = [sha256.Size]byte{}
+
+		msg := compactMessage(content, 64)
+		if c.hideNotificationContent {
+			msg = "***"
+		}
+		c.showNotification("Synced to Clipboard", msg)
+	}
 	return Waiting
 }
 
@@ -321,14 +561,12 @@ func (c *ClipboardSync) Transition(state State) State {
 // ------------------------------------------------------------------
 
 func main() {
-	// Argument parsing
 	filePath := flag.String("file-path", "./sync_clipboard.txt", "Path to the file used for syncing")
-	interval := flag.Float64("interval", 0.5, "Polling interval in seconds")
+	interval := flag.Float64("interval", defaultInterval, "Polling interval in seconds")
 	noNotify := flag.Bool("no-notify", false, "Disable desktop notifications")
 	hideNotifyContent := flag.Bool("hide-notify-content", false, "Hide clipboard content in desktop notifications")
 	logLevelFlag := flag.String("log-level", "info", "Log verbosity: debug, info, warn or error")
 	versionFlag := flag.Bool("version", false, "Show version")
-
 	flag.Parse()
 
 	if *versionFlag {
@@ -336,20 +574,15 @@ func main() {
 		os.Exit(0)
 	}
 
-	// Configure logging before emitting any messages. An invalid level falls back
-	// to INFO and is reported once logging is up.
 	level, levelErr := parseLogLevel(*logLevelFlag)
 	setupLogging(level)
 	if levelErr != nil {
 		slog.Warn("Invalid log level, defaulting to info", "err", levelErr)
 	}
 
-	if *interval < minInterval {
-		slog.Warn("Interval too small, clamping", "requested", *interval, "min", minInterval)
-		*interval = minInterval
-	}
+	*interval = validateInterval(*interval)
 
-	syncFile, err := filepath.Abs(*filePath)
+	syncFile, err := resolveFilePath(*filePath)
 	if err != nil {
 		slog.Error("Failed to resolve path", "err", err)
 		os.Exit(1)
@@ -363,9 +596,6 @@ func main() {
 		os.Exit(1)
 	}
 
-	// Graceful shutdown on SIGTERM / SIGINT (Ctrl+C). We signal via a channel and
-	// only act on it between transitions, so the process never exits in the
-	// middle of a file write.
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
 
@@ -380,21 +610,19 @@ func main() {
 		default:
 		}
 
-		// Record start time to keep interval drift-free
 		tStart := time.Now()
-
 		state = syncer.Transition(state)
 
-		elapsed := time.Since(tStart)
-		sleepFor := intervalDuration - elapsed
-
-		if sleepFor > 0 {
-			// Sleep, but wake up immediately on a shutdown signal.
-			select {
-			case <-sigChan:
-				slog.Info("Stopped")
-				return
-			case <-time.After(sleepFor):
+		if state == Waiting {
+			if sleepFor := intervalDuration - time.Since(tStart); sleepFor > 0 {
+				timer := time.NewTimer(sleepFor)
+				select {
+				case <-sigChan:
+					timer.Stop()
+					slog.Info("Stopped")
+					return
+				case <-timer.C:
+				}
 			}
 		}
 	}

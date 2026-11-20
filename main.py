@@ -1,25 +1,30 @@
 import argparse
+import hashlib
 import logging
+import math
 import os
+import queue
 import signal
-import sys
+import tempfile
 import threading
 import time
+from collections.abc import Callable
 from enum import Enum, auto
 from pathlib import Path
 
 import pyperclip
 from plyer import notification
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
-# Cap how much clipboard/file content we are willing to sync, to protect disk,
-# network and the OS from huge payloads (e.g. an image read back as a big blob).
 MAX_CONTENT_BYTES = 5 * 1024 * 1024  # 5 MiB
-
-# Smallest polling interval we accept. Anything lower turns the loop into a
-# busy-wait that hammers the clipboard backend and pins the CPU.
 MIN_INTERVAL = 0.05
+MAX_INTERVAL = 3600.0
+DEFAULT_INTERVAL = 0.5
+IO_RETRIES = 3
+RETRY_DELAY = 0.05
+
+logger = logging.getLogger(__name__)
 
 
 class State(Enum):
@@ -28,232 +33,413 @@ class State(Enum):
     COPYING_FILE_TO_CLIP = auto()
 
 
+def parse_log_level(value: str) -> tuple[int, bool]:
+    levels = {
+        "DEBUG": logging.DEBUG,
+        "INFO": logging.INFO,
+        "WARN": logging.WARNING,
+        "WARNING": logging.WARNING,
+        "ERROR": logging.ERROR,
+    }
+    key = value.strip().upper()
+    if key in levels:
+        return levels[key], True
+    return logging.INFO, False
+
+
+def validate_interval(interval: float) -> float:
+    if math.isnan(interval) or math.isinf(interval):
+        logger.warning(
+            "Interval %r is not finite, defaulting to %ss.", interval, DEFAULT_INTERVAL
+        )
+        return DEFAULT_INTERVAL
+    if interval < MIN_INTERVAL:
+        logger.warning(
+            "Interval %ss is too small, clamping to %ss.", interval, MIN_INTERVAL
+        )
+        return MIN_INTERVAL
+    if interval > MAX_INTERVAL:
+        logger.warning(
+            "Interval %ss is too large, clamping to %ss.", interval, MAX_INTERVAL
+        )
+        return MAX_INTERVAL
+    return interval
+
+
 def compact_message(content: str, limit: int = 64) -> str:
-    """Truncates string for cleaner log/notification output."""
-    if not content:
+    """Format a short preview for desktop notifications (never alters clipboard)."""
+    if not content or limit <= 0:
         return ""
-    content = content.replace("\n", " ").strip()
-    if len(content) > limit:
-        return content[: (limit - 3)] + "..."
-    return content
+    preview = content.replace("\r\n", " ").replace("\r", " ").replace("\n", " ").strip()
+    if len(preview) <= limit:
+        return preview
+    if limit <= 3:
+        return preview[:limit]
+    return preview[: limit - 3] + "..."
 
 
 class ClipboardSync:
+    """Bidirectional clipboard <-> file sync preserving exact UTF-8 content verbatim."""
+
     def __init__(
         self,
         file_path: Path,
         enable_notifications: bool = True,
         hide_notification_content: bool = False,
-    ):
-        # Resolve symlinks for consistent path comparison
+        *,
+        paste_fn: Callable[[], str | None] = pyperclip.paste,
+        copy_fn: Callable[[str], None] = pyperclip.copy,
+        notify_fn: Callable[..., None] = notification.notify,
+    ) -> None:
         self.file_path = file_path.resolve()
         self.enable_notifications = enable_notifications
         self.hide_notification_content = hide_notification_content
-
-        # Cache glob pattern components to avoid recomputing every cycle
         self._dir = self.file_path.parent
-        self._glob_pattern = f"{self.file_path.name}*"
+        self._file_name = self.file_path.name
 
-        # Ensure file exists
-        if not self.file_path.exists():
+        self._paste_fn = paste_fn
+        self._copy_fn = copy_fn
+        self._notify_fn = notify_fn
+
+        self._ensure_file_exists()
+
+        # Single bounded worker thread prevents unbounded threads if notifications hang.
+        self._notify_queue: queue.Queue[tuple[str, str, int]] = queue.Queue(maxsize=1)
+        if self.enable_notifications:
+            threading.Thread(target=self._notification_worker, daemon=True).start()
+
+        # Sync caches (updated only after reads/writes succeed).
+        self.last_clip = ""
+        self._clip_ready = False
+        self._oversized_clip_hash: bytes | None = None
+
+        self.last_mtime: float | None = None
+        self.last_file_content = ""
+
+        # Pending payloads waiting for the next state step.
+        self._pending_clip = ""
+        self._pending_file_content = ""
+        self._pending_mtime: float | None = None
+
+        # Log/scan deduplication state.
+        self._last_dir_mtime: float | None = None
+        self._last_conflicts: tuple[str, ...] = ()
+        self._last_empty_mtime: float | None = None
+        self._last_decode_err_mtime: float | None = None
+
+        # Seed initial state without modifying either clipboard or file.
+        clip, clip_ok = self._safe_paste()
+        if clip_ok:
+            self._init_clip(clip)
+
+        mtime, exists = self._get_mtime()
+        if exists:
+            content, read_ok, too_large = self._safe_read(mtime)
+            if read_ok:
+                self.last_mtime = mtime
+                if not too_large:
+                    self.last_file_content = content
+
+        logger.info("Sync initialized on: %s", self.file_path)
+
+    # ------------------------------------------------------------------
+    # Low-level I/O helpers (preserve exact bytes, never alter content)
+    # ------------------------------------------------------------------
+
+    def _ensure_file_exists(self) -> None:
+        if self.file_path.exists():
+            return
+        try:
+            fd = os.open(self.file_path, os.O_CREAT | os.O_WRONLY, 0o600)
+            os.close(fd)
+        except OSError as e:
+            logger.critical("Could not create file %s: %s", self.file_path, e)
+            raise
+
+    def _init_clip(self, clip: str) -> None:
+        raw = clip.encode("utf-8")
+        if len(raw) > MAX_CONTENT_BYTES:
+            self._oversized_clip_hash = hashlib.sha256(raw).digest()
+            self.last_clip = ""
+        else:
+            self.last_clip = clip
+        self._clip_ready = True
+
+    def _notification_worker(self) -> None:
+        while True:
+            title, message, timeout = self._notify_queue.get()
             try:
-                self.file_path.touch()
-            except OSError as e:
-                logging.critical(f"Could not create file {self.file_path}: {e}")
-                raise
-
-        # Initialize caches
-        self.last_clip, _ = self._safe_paste()
-        self.last_mtime: float = self._get_mtime()
-        self.last_file_content: str = self._safe_read()
-
-        logging.info(f"Sync initialized on: {self.file_path}")
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+                self._notify_fn(title=title, message=message, timeout=timeout)
+            except Exception as e:  # noqa: BLE001 — plyer backends raise varied OS/DBus errors
+                logger.warning("Notification failed: %s", e)
 
     def _show_notification(self, title: str, message: str, timeout: int = 1) -> None:
-        """Show desktop notification in a daemon thread to avoid blocking the loop."""
         if not self.enable_notifications:
             return
-
-        def _notify():
-            try:
-                notification.notify(title=title, message=message, timeout=timeout)
-            except Exception as e:
-                logging.warning(f"Notification failed: {e}")
-
-        t = threading.Thread(target=_notify, daemon=True)
-        t.start()
-
-    def _get_mtime(self) -> float:
-        """Returns the file modification timestamp, or 0.0 on error."""
         try:
-            return self.file_path.stat().st_mtime
+            self._notify_queue.get_nowait()
+        except queue.Empty:
+            pass
+        try:
+            self._notify_queue.put_nowait((title, message, timeout))
+        except queue.Full:
+            pass
+
+    def _get_mtime(self) -> tuple[float, bool]:
+        try:
+            return self.file_path.stat().st_mtime, True
         except OSError:
-            return 0.0
+            return 0.0, False
 
     def _safe_paste(self) -> tuple[str, bool]:
-        """Read clipboard with retries.
-
-        Returns ``(text, ok)``. Callers MUST distinguish a genuinely empty
-        clipboard (``("", True)``) from a failed read (``("", False)``): treating
-        a failed read as an empty clipboard would overwrite the synced file with
-        an empty string and wipe content on every other machine.
-        """
-        max_retries = 3
-        for attempt in range(max_retries):
+        for attempt in range(IO_RETRIES):
             try:
-                return (pyperclip.paste() or ""), True
-            except Exception as e:
-                if attempt < max_retries - 1:
-                    time.sleep(0.05)
+                return (self._paste_fn() or ""), True
+            except Exception as e:  # noqa: BLE001 — pyperclip backends raise varied OS errors
+                if attempt < IO_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
                     continue
-                error_msg = str(e)
-                if "completed successfully" in error_msg:
-                    logging.debug(f"Clipboard locked by another app: {error_msg}")
+                msg = str(e)
+                if "completed successfully" in msg:
+                    logger.debug("Clipboard locked by another app: %s", msg)
                 else:
-                    logging.debug(f"Clipboard access failed: {error_msg}")
-        # Signal failure rather than returning a stale/empty value as if it were real.
+                    logger.debug("Clipboard access failed: %s", msg)
         return "", False
 
-    def _safe_read(self) -> str:
-        """Read file as UTF-8 text. Returns '' on any error.
-
-        A single read call avoids the TOCTOU race between a separate
-        stat().st_size == 0 check and the actual read.
-        """
-        try:
-            return self.file_path.read_text(encoding="utf-8")
-        except Exception:
-            return ""
-
-    def _atomic_write(self, content: str) -> None:
-        """Write content via a temp file + atomic rename.
-
-        ``os.replace`` is atomic on the same filesystem, so a cloud sync tool
-        watching the file never observes a half-written or truncated state. The
-        temp name is hidden and does not share the watched file's prefix, so it
-        is neither flagged as a conflict file nor matched by the rclone filter.
-        """
-        tmp = self._dir / f".{self.file_path.name}.tmp"
-        try:
-            tmp.write_text(content, encoding="utf-8")
-            os.replace(tmp, self.file_path)
-        except OSError:
-            # Best-effort cleanup of a leftover temp file, then re-raise.
+    def _safe_copy(self, content: str) -> bool:
+        for attempt in range(IO_RETRIES):
             try:
-                tmp.unlink(missing_ok=True)
+                self._copy_fn(content)
+                return True
+            except Exception as e:  # noqa: BLE001 — pyperclip backends raise varied OS errors
+                if attempt < IO_RETRIES - 1:
+                    time.sleep(RETRY_DELAY)
+                    continue
+                logger.error("Copy failed: %s", e)
+        return False
+
+    def _safe_read(self, mtime: float | None = None) -> tuple[str, bool, bool]:
+        """Read up to MAX_CONTENT_BYTES+1 raw bytes; return (text, ok, too_large)."""
+        try:
+            with open(self.file_path, "rb") as f:
+                raw = f.read(MAX_CONTENT_BYTES + 1)
+        except OSError as e:
+            logger.debug("File read failed for %s: %s", self.file_path, e)
+            return "", False, False
+
+        if len(raw) > MAX_CONTENT_BYTES:
+            return "", True, True
+
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as e:
+            if mtime is None or mtime != self._last_decode_err_mtime:
+                logger.warning(
+                    "File %s is not valid UTF-8, waiting: %s", self.file_path, e
+                )
+                self._last_decode_err_mtime = mtime
+            return "", False, False
+
+        self._last_decode_err_mtime = None
+        return text, True, False
+
+    def _atomic_write(self, content: str) -> float:
+        """Write exact UTF-8 bytes via a unique 0600 temp file + atomic rename."""
+        data = content.encode("utf-8")
+        fd, tmp_name = tempfile.mkstemp(
+            dir=self._dir,
+            prefix=f".{self._file_name}.",
+            suffix=".tmp",
+        )
+        tmp_path = Path(tmp_name)
+        try:
+            try:
+                f = os.fdopen(fd, "wb")
+            except BaseException:
+                os.close(fd)
+                raise
+            with f:
+                f.write(data)
+
+            written_mtime = tmp_path.stat().st_mtime
+            for attempt in range(IO_RETRIES):
+                try:
+                    os.replace(tmp_path, self.file_path)
+                    break
+                except OSError:
+                    if attempt < IO_RETRIES - 1:
+                        time.sleep(RETRY_DELAY)
+                        continue
+                    raise
+            return written_mtime
+        except BaseException:
+            try:
+                tmp_path.unlink(missing_ok=True)
             except OSError:
                 pass
             raise
 
     def _check_conflicts(self) -> None:
-        """Log any conflict/duplicate files created by sync tools."""
-        sync_files = [
-            f
-            for f in self._dir.glob(self._glob_pattern)
-            if f.is_file() and f != self.file_path
-        ]
-        if sync_files:
-            logging.warning(
-                f"Potential conflict files detected: {[f.name for f in sync_files]}"
+        try:
+            dir_mtime = self._dir.stat().st_mtime
+        except OSError:
+            return
+        if dir_mtime == self._last_dir_mtime:
+            return
+        self._last_dir_mtime = dir_mtime
+
+        try:
+            conflicts = tuple(
+                sorted(
+                    entry.name
+                    for entry in os.scandir(self._dir)
+                    if entry.name != self._file_name
+                    and entry.name.startswith(self._file_name)
+                    and entry.is_file()
+                )
             )
+        except OSError:
+            return
+
+        if conflicts != self._last_conflicts:
+            self._last_conflicts = conflicts
+            if conflicts:
+                logger.warning("Potential conflict files detected: %s", list(conflicts))
+            else:
+                logger.info("Conflict files cleared.")
 
     # ------------------------------------------------------------------
     # State machine
     # ------------------------------------------------------------------
 
     def transition(self, state: State) -> State:
-        """Advance the state machine by one step."""
-
         if state == State.WAITING:
-            # 1. Check clipboard change. Ignore failed reads (ok is False) so a
-            # transient clipboard error is never propagated as an empty write.
-            current_clip, ok = self._safe_paste()
-            if ok and current_clip != self.last_clip:
-                self.last_clip = current_clip
-                return State.WRITING_CLIP_TO_FILE
-
-            # 2. File existence check
-            if not self.file_path.exists():
-                logging.info(f"File {self.file_path} vanished (syncing?), waiting...")
-                return State.WAITING
-
-            # 3. Conflict detection (cached pattern, no extra stat per cycle)
-            self._check_conflicts()
-
-            # 4. Check file change by mtime
-            current_mtime = self._get_mtime()
-            if current_mtime == self.last_mtime:
-                return State.WAITING
-
-            self.last_mtime = current_mtime
-
-            # Single read — avoids TOCTOU race between size check and content read
-            current_file_content = self._safe_read()
-            if not current_file_content:
-                logging.info(
-                    f"File {self.file_path} is empty (cloud sync lock?), waiting..."
-                )
-                return State.WAITING
-
-            if current_file_content != self.last_file_content:
-                if len(current_file_content.encode("utf-8")) > MAX_CONTENT_BYTES:
-                    logging.warning(
-                        f"File content exceeds {MAX_CONTENT_BYTES}-byte limit, "
-                        "skipping clipboard copy."
-                    )
-                    # Remember it to avoid repeating the warning every cycle.
-                    self.last_file_content = current_file_content
-                    return State.WAITING
-                self.last_file_content = current_file_content
-                return State.COPYING_FILE_TO_CLIP
-
-            logging.info(
-                f"File {self.file_path} mtime changed but content is unchanged."
-            )
-            return State.WAITING
-
+            return self._poll()
         if state == State.WRITING_CLIP_TO_FILE:
-            if len(self.last_clip.encode("utf-8")) > MAX_CONTENT_BYTES:
-                logging.warning(
-                    f"Clipboard content exceeds {MAX_CONTENT_BYTES}-byte limit, "
-                    "skipping file write."
-                )
-                return State.WAITING
-            logging.info(f"Clipboard -> File ({len(self.last_clip)} chars)")
-            try:
-                self._atomic_write(self.last_clip)
-                # Update caches immediately to suppress self-triggered file-change detection
-                self.last_file_content = self.last_clip
-                self.last_mtime = self._get_mtime()
-            except OSError as e:
-                logging.error(f"Write failed: {e}")
-            return State.WAITING
-
+            return self._write_clip_to_file()
         if state == State.COPYING_FILE_TO_CLIP:
-            logging.info(f"File -> Clipboard ({len(self.last_file_content)} chars)")
-            try:
-                pyperclip.copy(self.last_file_content)
-                # Update cache before notification (non-blocking) to prevent echo
-                self.last_clip = self.last_file_content
+            return self._copy_file_to_clip()
+        return State.WAITING
 
-                notify_msg = (
-                    "***"
-                    if self.hide_notification_content
-                    else compact_message(self.last_file_content)
-                )
-                self._show_notification(
-                    title="Synced to Clipboard",
-                    message=notify_msg,
-                    timeout=1,
-                )
-            except Exception as e:
-                logging.error(f"Copy failed: {e}")
+    def _poll(self) -> State:
+        next_state = self._check_clipboard()
+        if next_state != State.WAITING:
+            return next_state
+        return self._check_file()
+
+    def _check_clipboard(self) -> State:
+        current_clip, ok = self._safe_paste()
+        if not ok:
             return State.WAITING
 
+        if not self._clip_ready:
+            self._init_clip(current_clip)
+            return State.WAITING
+
+        if current_clip == self.last_clip:
+            return State.WAITING
+
+        if not current_clip:
+            logger.debug("Clipboard is empty or non-text, skipping file write.")
+            self.last_clip = ""
+            self._oversized_clip_hash = None
+            return State.WAITING
+
+        raw = current_clip.encode("utf-8")
+        if len(raw) > MAX_CONTENT_BYTES:
+            digest = hashlib.sha256(raw).digest()
+            if digest != self._oversized_clip_hash:
+                logger.warning(
+                    "Clipboard content (%d bytes) exceeds %d-byte limit, "
+                    "skipping file write.",
+                    len(raw),
+                    MAX_CONTENT_BYTES,
+                )
+                self._oversized_clip_hash = digest
+            return State.WAITING
+
+        self._oversized_clip_hash = None
+        self._pending_clip = current_clip
+        return State.WRITING_CLIP_TO_FILE
+
+    def _check_file(self) -> State:
+        current_mtime, exists = self._get_mtime()
+        if not exists:
+            logger.debug("File %s vanished (syncing?), waiting...", self.file_path)
+            return State.WAITING
+
+        self._check_conflicts()
+
+        if current_mtime == self.last_mtime:
+            return State.WAITING
+
+        content, read_ok, too_large = self._safe_read(current_mtime)
+        if not read_ok:
+            return State.WAITING
+
+        if too_large:
+            logger.warning(
+                "File content exceeds %d-byte limit, skipping clipboard copy.",
+                MAX_CONTENT_BYTES,
+            )
+            self.last_mtime = current_mtime
+            return State.WAITING
+
+        if not content:
+            if current_mtime != self._last_empty_mtime:
+                logger.debug(
+                    "File %s is empty (cloud sync lock?), waiting...", self.file_path
+                )
+                self._last_empty_mtime = current_mtime
+            return State.WAITING
+
+        self._last_empty_mtime = None
+
+        if content != self.last_file_content:
+            self._pending_file_content = content
+            self._pending_mtime = current_mtime
+            return State.COPYING_FILE_TO_CLIP
+
+        self.last_mtime = current_mtime
+        logger.debug("File %s mtime changed but content is unchanged.", self.file_path)
+        return State.WAITING
+
+    def _write_clip_to_file(self) -> State:
+        content = self._pending_clip
+        self._pending_clip = ""
+        if not content:
+            return State.WAITING
+
+        logger.info("Clipboard -> File (%d chars)", len(content))
+        try:
+            written_mtime = self._atomic_write(content)
+            self.last_clip = content
+            self.last_file_content = content
+            self.last_mtime = written_mtime
+        except OSError as e:
+            logger.error("Write failed: %s", e)
+        return State.WAITING
+
+    def _copy_file_to_clip(self) -> State:
+        content = self._pending_file_content
+        mtime = self._pending_mtime
+        self._pending_file_content = ""
+        self._pending_mtime = None
+        if not content:
+            return State.WAITING
+
+        logger.info("File -> Clipboard (%d chars)", len(content))
+        if self._safe_copy(content):
+            self.last_clip = content
+            self._clip_ready = True
+            self.last_file_content = content
+            self.last_mtime = mtime
+            self._oversized_clip_hash = None
+
+            notify_msg = (
+                "***" if self.hide_notification_content else compact_message(content)
+            )
+            self._show_notification("Synced to Clipboard", notify_msg, timeout=1)
         return State.WAITING
 
 
@@ -263,12 +449,6 @@ class ClipboardSync:
 
 
 def main() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(message)s",
-        datefmt="%H:%M:%S",
-    )
-
     parser = argparse.ArgumentParser(description="Bidirectional Clipboard Sync")
     parser.add_argument(
         "--file-path",
@@ -279,7 +459,7 @@ def main() -> None:
     parser.add_argument(
         "--interval",
         type=float,
-        default=0.5,
+        default=DEFAULT_INTERVAL,
         help="Polling interval in seconds",
     )
     parser.add_argument(
@@ -293,22 +473,38 @@ def main() -> None:
         help="Hide clipboard content in desktop notifications",
     )
     parser.add_argument(
+        "--log-level",
+        type=str,
+        default="info",
+        help="Log verbosity: debug, info, warn or error",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s {__version__}",
     )
     args = parser.parse_args()
 
-    if args.interval < MIN_INTERVAL:
-        logging.warning(
-            f"Interval {args.interval}s is too small, clamping to {MIN_INTERVAL}s."
+    level, level_ok = parse_log_level(args.log_level)
+    logging.basicConfig(
+        level=level,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%H:%M:%S",
+    )
+    if not level_ok:
+        logger.warning(
+            "Unknown log level %r (use debug, info, warn or error), "
+            "defaulting to info.",
+            args.log_level,
         )
-        args.interval = MIN_INTERVAL
 
+    args.interval = validate_interval(args.interval)
     sync_file = args.file_path.resolve()
-    logging.info(
-        f"Sync (v{__version__}) starting — interval: {args.interval}s, "
-        f"file: {sync_file}. Press Ctrl+C to stop."
+    logger.info(
+        "Sync (v%s) starting — interval: %ss, file: %s. Press Ctrl+C to stop.",
+        __version__,
+        args.interval,
+        sync_file,
     )
 
     syncer = ClipboardSync(
@@ -317,24 +513,20 @@ def main() -> None:
         hide_notification_content=args.hide_notify_content,
     )
 
-    # Graceful shutdown on SIGTERM (Ctrl+C is handled by KeyboardInterrupt below)
-    def _handle_sigterm(signum, frame):
-        logging.info("Received SIGTERM. Stopped.")
-        sys.exit(0)
-
-    signal.signal(signal.SIGTERM, _handle_sigterm)
+    stop_event = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
+    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
 
     state = State.WAITING
-    try:
-        while True:
-            # Record start time to keep interval drift-free
-            t_start = time.monotonic()
-            state = syncer.transition(state)
-            elapsed = time.monotonic() - t_start
-            sleep_for = max(0.0, args.interval - elapsed)
-            time.sleep(sleep_for)
-    except KeyboardInterrupt:
-        logging.info("Stopped.")
+    while not stop_event.is_set():
+        t_start = time.monotonic()
+        state = syncer.transition(state)
+        if state == State.WAITING:
+            sleep_for = args.interval - (time.monotonic() - t_start)
+            if sleep_for > 0:
+                stop_event.wait(sleep_for)
+
+    logger.info("Stopped.")
 
 
 if __name__ == "__main__":
