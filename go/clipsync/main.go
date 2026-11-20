@@ -52,7 +52,7 @@ func setupLogging(level slog.Level) {
 		Level: level,
 		ReplaceAttr: func(groups []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey && len(groups) == 0 {
-				a.Value = slog.StringValue(a.Value.Time().Format("15:04:05"))
+				a.Value = slog.StringValue(a.Value.Time().Format("2006-01-02 15:04:05"))
 			}
 			return a
 		},
