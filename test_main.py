@@ -43,6 +43,22 @@ class FakeClipboard:
 
 
 class TestAutoClip(unittest.TestCase):
+    @staticmethod
+    def _make(sync_file: Path, clip: FakeClipboard) -> autoclip.ClipboardSync:
+        return autoclip.ClipboardSync(
+            sync_file,
+            enable_notifications=False,
+            paste_fn=clip.paste,
+            copy_fn=clip.copy,
+        )
+
+    @staticmethod
+    def _bump_mtime(path: Path, seconds: float = 2.0) -> float:
+        """Move path's mtime into the future so the next poll sees a new version."""
+        future = path.stat().st_mtime + seconds
+        os.utime(path, (future, future))
+        return path.stat().st_mtime
+
     def test_compact_message(self) -> None:
         self.assertEqual(autoclip.compact_message("a\r\nb\rc\nd", 64), "a b c d")
         self.assertEqual(autoclip.compact_message("abcdef", 2), "ab")
@@ -75,12 +91,7 @@ class TestAutoClip(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             sync_file = Path(tmp) / "sync_clipboard.txt"
             clip = FakeClipboard("init")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
 
             clip.text = "  line1\r\nline2\rline3\n  "
             state = s.transition(autoclip.State.WAITING)
@@ -97,40 +108,31 @@ class TestAutoClip(unittest.TestCase):
             sync_file = Path(tmp) / "sync_clipboard.txt"
             sync_file.write_bytes(b"initial")
             clip = FakeClipboard("initial")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
 
             sync_file.write_bytes(b"  from-remote\r\nline2  ")
-            future = sync_file.stat().st_mtime + 2.0
-            os.utime(sync_file, (future, future))
+            mtime = self._bump_mtime(sync_file)
 
             clip.write_error = RuntimeError("clipboard locked")
             state = s.transition(autoclip.State.WAITING)
             self.assertEqual(state, autoclip.State.COPYING_FILE_TO_CLIP)
             state = s.transition(state)
             self.assertEqual(state, autoclip.State.WAITING)
+            self.assertEqual(s._last_copy_fail_mtime, mtime)  # log dedup
 
             clip.write_error = None
             state = s.transition(autoclip.State.WAITING)
             self.assertEqual(state, autoclip.State.COPYING_FILE_TO_CLIP)
             s.transition(state)
             self.assertEqual(clip.text, "  from-remote\r\nline2  ")
+            self.assertIsNone(s._last_copy_fail_mtime)
 
     def test_empty_clipboard_does_not_wipe_file(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sync_file = Path(tmp) / "sync_clipboard.txt"
             sync_file.write_bytes(b"keep-me")
             clip = FakeClipboard("keep-me")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
 
             clip.text = ""
             state = s.transition(autoclip.State.WAITING)
@@ -143,12 +145,7 @@ class TestAutoClip(unittest.TestCase):
             sync_file.write_bytes(b"remote-content")
             clip = FakeClipboard("old-local-clip")
             clip.read_error = RuntimeError("not ready")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
 
             clip.read_error = None
             state = s.transition(autoclip.State.WAITING)
@@ -160,16 +157,10 @@ class TestAutoClip(unittest.TestCase):
             sync_file = Path(tmp) / "sync_clipboard.txt"
             sync_file.write_bytes(b"ok")
             clip = FakeClipboard("ok")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
 
             sync_file.write_bytes(b"A" * (autoclip.MAX_CONTENT_BYTES + 10))
-            future = sync_file.stat().st_mtime + 2.0
-            os.utime(sync_file, (future, future))
+            self._bump_mtime(sync_file)
 
             state = s.transition(autoclip.State.WAITING)
             self.assertEqual(state, autoclip.State.WAITING)
@@ -185,28 +176,9 @@ class TestAutoClip(unittest.TestCase):
             conflict_file.write_bytes(b"dup")
 
             clip = FakeClipboard("ok")
-            s = autoclip.ClipboardSync(
-                sync_file,
-                enable_notifications=False,
-                paste_fn=clip.paste,
-                copy_fn=clip.copy,
-            )
+            s = self._make(sync_file, clip)
             s._check_conflicts()
             self.assertEqual(s._last_conflicts, ("clip[0].txt.conflict1",))
-
-    def _make(self, sync_file: Path, clip: FakeClipboard) -> autoclip.ClipboardSync:
-        return autoclip.ClipboardSync(
-            sync_file,
-            enable_notifications=False,
-            paste_fn=clip.paste,
-            copy_fn=clip.copy,
-        )
-
-    @staticmethod
-    def _bump_mtime(path: Path, seconds: float = 2.0) -> float:
-        future = path.stat().st_mtime + seconds
-        os.utime(path, (future, future))
-        return path.stat().st_mtime
 
     def test_lone_surrogate_clipboard_skipped_without_crash(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -219,9 +191,9 @@ class TestAutoClip(unittest.TestCase):
                 state = s.transition(autoclip.State.WAITING)
                 self.assertEqual(state, autoclip.State.WAITING)
             clip.text = "also\udc00bad"
-            self.assertEqual(
-                s.transition(autoclip.State.WAITING), autoclip.State.WAITING
-            )
+            state = s.transition(autoclip.State.WAITING)
+            self.assertEqual(state, autoclip.State.WAITING)
+            self.assertEqual(s.last_clip, clip.text)  # retained: repeats short-circuit
             self.assertEqual(sync_file.read_bytes(), b"keep-me")
 
             clip.text = "good"
@@ -230,7 +202,7 @@ class TestAutoClip(unittest.TestCase):
                 autoclip.State.WRITING_CLIP_TO_FILE,
             )
 
-    def test_invalid_utf8_file_not_reread_until_mtime_changes(self) -> None:
+    def test_invalid_utf8_file_skipped_until_mtime_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             sync_file = Path(tmp) / "sync_clipboard.txt"
             sync_file.write_bytes(b"ok")
@@ -239,22 +211,10 @@ class TestAutoClip(unittest.TestCase):
 
             sync_file.write_bytes(b"a\xff\xfeb")
             bad_mtime = self._bump_mtime(sync_file)
-            self.assertEqual(
-                s.transition(autoclip.State.WAITING), autoclip.State.WAITING
-            )
-            self.assertEqual(s._last_decode_err_mtime, bad_mtime)
-
-            reads = 0
-            original = s._safe_read
-
-            def counting_read(mtime: float | None = None) -> tuple[str, bool, bool]:
-                nonlocal reads
-                reads += 1
-                return original(mtime)
-
-            s._safe_read = counting_read  # type: ignore[method-assign]
-            s.transition(autoclip.State.WAITING)
-            self.assertEqual(reads, 0)
+            state = s.transition(autoclip.State.WAITING)
+            self.assertEqual(state, autoclip.State.WAITING)
+            self.assertEqual(clip.text, "ok")
+            self.assertEqual(s.last_mtime, bad_mtime)  # version consumed, no re-read
 
             sync_file.write_bytes(b"fixed")
             self._bump_mtime(sync_file, 4.0)
@@ -262,24 +222,6 @@ class TestAutoClip(unittest.TestCase):
             self.assertEqual(state, autoclip.State.COPYING_FILE_TO_CLIP)
             s.transition(state)
             self.assertEqual(clip.text, "fixed")
-
-    def test_copy_failure_remembered_per_mtime(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            sync_file = Path(tmp) / "sync_clipboard.txt"
-            sync_file.write_bytes(b"initial")
-            clip = FakeClipboard("initial")
-            s = self._make(sync_file, clip)
-
-            sync_file.write_bytes(b"remote")
-            mtime = self._bump_mtime(sync_file)
-            clip.write_error = RuntimeError("clipboard locked")
-            s.transition(s.transition(autoclip.State.WAITING))
-            self.assertEqual(s._last_copy_fail_mtime, mtime)
-
-            clip.write_error = None
-            s.transition(s.transition(autoclip.State.WAITING))
-            self.assertEqual(clip.text, "remote")
-            self.assertIsNone(s._last_copy_fail_mtime)
 
 
 if __name__ == "__main__":

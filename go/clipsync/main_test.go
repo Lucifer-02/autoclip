@@ -41,6 +41,20 @@ func (f *fakeClipboard) write(s string) error {
 
 func noopNotify(title, message string, icon any) error { return nil }
 
+// bumpMtime moves file's mtime d into the future so the next poll sees a new version.
+func bumpMtime(t *testing.T, file string, d time.Duration) time.Time {
+	t.Helper()
+	future := time.Now().Add(d)
+	if err := os.Chtimes(file, future, future); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(file)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return info.ModTime()
+}
+
 func newTestSync(t *testing.T, file string, clip *fakeClipboard) *ClipboardSync {
 	t.Helper()
 	s, err := newClipboardSync(file, false, false, ioBackends{
@@ -139,8 +153,7 @@ func TestTransientCopyErrorRetriesNextCycle(t *testing.T) {
 	if err := os.WriteFile(file, []byte("  from-remote\r\nline2  "), 0600); err != nil {
 		t.Fatal(err)
 	}
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(file, future, future)
+	mtime := bumpMtime(t, file, 2*time.Second)
 
 	clip.writeErr = errors.New("clipboard locked")
 	state := s.Transition(Waiting)
@@ -148,6 +161,9 @@ func TestTransientCopyErrorRetriesNextCycle(t *testing.T) {
 		t.Fatalf("expected CopyingFileToClip, got %v", state)
 	}
 	s.Transition(state)
+	if !s.lastCopyFailMtime.Equal(mtime) {
+		t.Fatalf("expected failed mtime remembered for log dedup, got %v", s.lastCopyFailMtime)
+	}
 
 	clip.writeErr = nil
 	state = s.Transition(Waiting)
@@ -157,6 +173,9 @@ func TestTransientCopyErrorRetriesNextCycle(t *testing.T) {
 	s.Transition(state)
 	if clip.text != "  from-remote\r\nline2  " {
 		t.Fatalf("expected verbatim clipboard after retry, got %q", clip.text)
+	}
+	if !s.lastCopyFailMtime.IsZero() {
+		t.Fatalf("expected recovery to clear failure state, got %v", s.lastCopyFailMtime)
 	}
 }
 
@@ -216,8 +235,7 @@ func TestOversizedFileSkippedWithoutOOM(t *testing.T) {
 	if err := os.WriteFile(file, []byte(big), 0600); err != nil {
 		t.Fatal(err)
 	}
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(file, future, future)
+	bumpMtime(t, file, 2*time.Second)
 
 	if state := s.Transition(Waiting); state != Waiting {
 		t.Fatalf("expected oversized file skipped, got %v", state)
@@ -250,7 +268,7 @@ func TestConflictCheckHandlesGlobMetacharacters(t *testing.T) {
 	}
 }
 
-func TestInvalidUTF8FileSkippedAndNotReread(t *testing.T) {
+func TestInvalidUTF8FileSkippedUntilMtimeChanges(t *testing.T) {
 	dir := t.TempDir()
 	file := filepath.Join(dir, "sync_clipboard.txt")
 	if err := os.WriteFile(file, []byte("ok"), 0600); err != nil {
@@ -263,8 +281,7 @@ func TestInvalidUTF8FileSkippedAndNotReread(t *testing.T) {
 	if err := os.WriteFile(file, []byte{'a', 0xff, 0xfe, 'b'}, 0600); err != nil {
 		t.Fatal(err)
 	}
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(file, future, future)
+	bad := bumpMtime(t, file, 2*time.Second)
 
 	if state := s.Transition(Waiting); state != Waiting {
 		t.Fatalf("expected invalid UTF-8 file skipped, got %v", state)
@@ -272,16 +289,15 @@ func TestInvalidUTF8FileSkippedAndNotReread(t *testing.T) {
 	if clip.writes != 0 || clip.text != "ok" {
 		t.Fatalf("clipboard must not receive invalid UTF-8, got %q", clip.text)
 	}
-	if !s.lastInvalidMtime.Equal(future) {
-		t.Fatalf("expected invalid mtime remembered, got %v", s.lastInvalidMtime)
+	if !s.lastMtime.Equal(bad) {
+		t.Fatalf("expected invalid file version consumed, got %v", s.lastMtime)
 	}
 
 	// A later valid write (new mtime) is picked up again.
 	if err := os.WriteFile(file, []byte("fixed"), 0600); err != nil {
 		t.Fatal(err)
 	}
-	later := future.Add(2 * time.Second)
-	_ = os.Chtimes(file, later, later)
+	bumpMtime(t, file, 4*time.Second)
 	state := s.Transition(Waiting)
 	if state != CopyingFileToClip {
 		t.Fatalf("expected valid file copied after recovery, got %v", state)
@@ -308,6 +324,9 @@ func TestInvalidUTF8ClipboardSkipped(t *testing.T) {
 			t.Fatalf("expected invalid clipboard skipped, got %v", state)
 		}
 	}
+	if s.lastClip != clip.text {
+		t.Fatalf("expected invalid clip retained so repeats short-circuit")
+	}
 	raw, _ := os.ReadFile(file)
 	if string(raw) != "keep-me" {
 		t.Fatalf("file overwritten with invalid UTF-8: %q", string(raw))
@@ -316,34 +335,5 @@ func TestInvalidUTF8ClipboardSkipped(t *testing.T) {
 	clip.text = "good"
 	if state := s.Transition(Waiting); state != WritingClipToFile {
 		t.Fatalf("expected valid clipboard written, got %v", state)
-	}
-}
-
-func TestCopyFailureRememberedPerMtime(t *testing.T) {
-	dir := t.TempDir()
-	file := filepath.Join(dir, "sync_clipboard.txt")
-	if err := os.WriteFile(file, []byte("initial"), 0600); err != nil {
-		t.Fatal(err)
-	}
-
-	clip := &fakeClipboard{text: "initial"}
-	s := newTestSync(t, file, clip)
-
-	if err := os.WriteFile(file, []byte("remote"), 0600); err != nil {
-		t.Fatal(err)
-	}
-	future := time.Now().Add(2 * time.Second)
-	_ = os.Chtimes(file, future, future)
-
-	clip.writeErr = errors.New("clipboard locked")
-	s.Transition(s.Transition(Waiting))
-	if !s.lastCopyFailMtime.Equal(future) {
-		t.Fatalf("expected failed mtime remembered, got %v", s.lastCopyFailMtime)
-	}
-
-	clip.writeErr = nil
-	s.Transition(s.Transition(Waiting))
-	if clip.text != "remote" || !s.lastCopyFailMtime.IsZero() {
-		t.Fatalf("expected recovery to clear failure state, clip=%q fail=%v", clip.text, s.lastCopyFailMtime)
 	}
 }

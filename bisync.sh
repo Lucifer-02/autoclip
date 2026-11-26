@@ -31,8 +31,13 @@ if ! command -v "$RCLONE" >/dev/null 2>&1; then
   exit 1
 fi
 
+run_bisync() {
+  "$RCLONE" bisync "$DRIVE:sync" "$LOCAL_PATH" "${COMMON_FLAGS[@]}" "$@"
+}
+
+# Same "newer wins" rule as the loop's conflict resolution (default would be path1).
 resync() {
-  "$RCLONE" bisync "$DRIVE:sync" "$LOCAL_PATH" "${COMMON_FLAGS[@]}" --verbose --resync
+  run_bisync --verbose --resync --resync-mode newer
 }
 
 log "Running initial resync..."
@@ -43,7 +48,7 @@ fi
 
 failures=0
 while true; do
-  if "$RCLONE" bisync "$DRIVE:sync" "$LOCAL_PATH" "${COMMON_FLAGS[@]}" "${LOOP_FLAGS[@]}"; then
+  if run_bisync "${LOOP_FLAGS[@]}"; then
     if ((failures > 0)); then
       log "Bisync recovered after ${failures} failure(s)."
     fi
