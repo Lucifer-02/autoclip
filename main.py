@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pyperclip
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 MAX_CONTENT_BYTES = 5 * 1024 * 1024  # 5 MiB
 MIN_INTERVAL = 0.05
@@ -77,6 +77,11 @@ def compact_message(content: str, limit: int = 64) -> str:
     return preview[: limit - 3] + "..."
 
 
+def _clip_digest(clip: str) -> bytes:
+    """SHA-256 of a clipboard string, tolerating lone surrogates."""
+    return hashlib.sha256(clip.encode("utf-8", "surrogatepass")).digest()
+
+
 class ClipboardSync:
     """Bidirectional clipboard <-> file sync preserving exact UTF-8 content verbatim."""
 
@@ -116,7 +121,7 @@ class ClipboardSync:
         # Sync caches (updated only after reads/writes succeed).
         self.last_clip = ""
         self._clip_ready = False
-        self._oversized_clip_hash: bytes | None = None
+        self._skipped_clip_hash: bytes | None = None
 
         self.last_mtime: float | None = None
         self.last_file_content = ""
@@ -131,6 +136,7 @@ class ClipboardSync:
         self._last_conflicts: tuple[str, ...] = ()
         self._last_empty_mtime: float | None = None
         self._last_decode_err_mtime: float | None = None
+        self._last_copy_fail_mtime: float | None = None
 
         # Seed initial state without modifying either clipboard or file.
         clip, clip_ok = self._safe_paste()
@@ -160,13 +166,23 @@ class ClipboardSync:
             raise
 
     def _init_clip(self, clip: str) -> None:
-        raw = clip.encode("utf-8")
-        if len(raw) > MAX_CONTENT_BYTES:
-            self._oversized_clip_hash = hashlib.sha256(raw).digest()
-            self.last_clip = ""
-        else:
-            self.last_clip = clip
         self._clip_ready = True
+        self.last_clip = ""
+        try:
+            raw = clip.encode("utf-8")
+        except UnicodeEncodeError:
+            self._skipped_clip_hash = _clip_digest(clip)
+            return
+        if len(raw) > MAX_CONTENT_BYTES:
+            self._skipped_clip_hash = hashlib.sha256(raw).digest()
+            return
+        self.last_clip = clip
+
+    def _skip_clip(self, digest: bytes, msg: str, *args: object) -> None:
+        """Remember an unsyncable clipboard payload by digest; warn once per payload."""
+        if digest != self._skipped_clip_hash:
+            logger.warning(msg, *args)
+            self._skipped_clip_hash = digest
 
     def _notification_worker(self) -> None:
         while True:
@@ -211,17 +227,18 @@ class ClipboardSync:
                     logger.debug("Clipboard access failed: %s", msg)
         return "", False
 
-    def _safe_copy(self, content: str) -> bool:
+    def _safe_copy(self, content: str) -> Exception | None:
+        """Copy to clipboard with retries; return the last error, or None on success."""
+        error: Exception | None = None
         for attempt in range(IO_RETRIES):
             try:
                 self._copy_fn(content)
-                return True
+                return None
             except Exception as e:  # noqa: BLE001 — pyperclip backends raise varied OS errors
+                error = e
                 if attempt < IO_RETRIES - 1:
                     time.sleep(RETRY_DELAY)
-                    continue
-                logger.error("Copy failed: %s", e)
-        return False
+        return error
 
     def _safe_read(self, mtime: float | None = None) -> tuple[str, bool, bool]:
         """Read up to MAX_CONTENT_BYTES+1 raw bytes; return (text, ok, too_large)."""
@@ -347,23 +364,30 @@ class ClipboardSync:
         if not current_clip:
             logger.debug("Clipboard is empty or non-text, skipping file write.")
             self.last_clip = ""
-            self._oversized_clip_hash = None
+            self._skipped_clip_hash = None
             return State.WAITING
 
-        raw = current_clip.encode("utf-8")
+        try:
+            raw = current_clip.encode("utf-8")
+        except UnicodeEncodeError as e:
+            # e.g. lone surrogates from a truncated emoji on Windows.
+            self._skip_clip(
+                _clip_digest(current_clip),
+                "Clipboard content is not valid UTF-8 (%s), skipping file write.",
+                e.reason,
+            )
+            return State.WAITING
         if len(raw) > MAX_CONTENT_BYTES:
-            digest = hashlib.sha256(raw).digest()
-            if digest != self._oversized_clip_hash:
-                logger.warning(
-                    "Clipboard content (%d bytes) exceeds %d-byte limit, "
-                    "skipping file write.",
-                    len(raw),
-                    MAX_CONTENT_BYTES,
-                )
-                self._oversized_clip_hash = digest
+            self._skip_clip(
+                hashlib.sha256(raw).digest(),
+                "Clipboard content (%d bytes) exceeds %d-byte limit, "
+                "skipping file write.",
+                len(raw),
+                MAX_CONTENT_BYTES,
+            )
             return State.WAITING
 
-        self._oversized_clip_hash = None
+        self._skipped_clip_hash = None
         self._pending_clip = current_clip
         return State.WRITING_CLIP_TO_FILE
 
@@ -376,6 +400,9 @@ class ClipboardSync:
         self._check_conflicts()
 
         if current_mtime == self.last_mtime:
+            return State.WAITING
+        # Don't re-read up to 5 MiB every poll for a file already known to be invalid.
+        if current_mtime == self._last_decode_err_mtime:
             return State.WAITING
 
         content, read_ok, too_large = self._safe_read(current_mtime)
@@ -433,18 +460,28 @@ class ClipboardSync:
         if not content:
             return State.WAITING
 
-        logger.info("File -> Clipboard (%d chars)", len(content))
-        if self._safe_copy(content):
-            self.last_clip = content
-            self._clip_ready = True
-            self.last_file_content = content
-            self.last_mtime = mtime
-            self._oversized_clip_hash = None
+        error = self._safe_copy(content)
+        if error is not None:
+            # Caches stay untouched so the next poll retries; log loudly once per file version.
+            if mtime != self._last_copy_fail_mtime:
+                logger.error("Copy failed, will keep retrying: %s", error)
+                self._last_copy_fail_mtime = mtime
+            else:
+                logger.debug("Copy failed again: %s", error)
+            return State.WAITING
 
-            notify_msg = (
-                "***" if self.hide_notification_content else compact_message(content)
-            )
-            self._show_notification("Synced to Clipboard", notify_msg, timeout=1)
+        logger.info("File -> Clipboard (%d chars)", len(content))
+        self._last_copy_fail_mtime = None
+        self.last_clip = content
+        self._clip_ready = True
+        self.last_file_content = content
+        self.last_mtime = mtime
+        self._skipped_clip_hash = None
+
+        notify_msg = (
+            "***" if self.hide_notification_content else compact_message(content)
+        )
+        self._show_notification("Synced to Clipboard", notify_msg, timeout=1)
         return State.WAITING
 
 
@@ -534,7 +571,11 @@ def main() -> None:
     state = State.WAITING
     while not stop_event.is_set():
         t_start = time.monotonic()
-        state = syncer.transition(state)
+        try:
+            state = syncer.transition(state)
+        except Exception:  # keep the daemon alive on unexpected errors
+            logger.exception("Unexpected error in state %s, resetting.", state.name)
+            state = State.WAITING
         if state == State.WAITING:
             sleep_for = args.interval - (time.monotonic() - t_start)
             if sleep_for > 0:

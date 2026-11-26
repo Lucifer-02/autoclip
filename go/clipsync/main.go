@@ -15,12 +15,13 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unicode/utf8"
 
 	"github.com/atotto/clipboard"
 	"github.com/gen2brain/beeep"
 )
 
-const Version = "0.5.0"
+const Version = "0.6.0"
 
 const (
 	maxContentBytes = 5 * 1024 * 1024 // 5 MiB
@@ -160,11 +161,11 @@ type ClipboardSync struct {
 	notifyCh chan notifyPayload
 
 	// Sync caches (updated only after reads/writes succeed).
-	clipReady         bool
-	lastClip          string
-	oversizedClipHash [sha256.Size]byte
-	lastMtime         time.Time
-	lastFileContent   string
+	clipReady       bool
+	lastClip        string
+	skippedClipHash [sha256.Size]byte
+	lastMtime       time.Time
+	lastFileContent string
 
 	// Pending payloads waiting for the next state step.
 	pendingClip        string
@@ -172,9 +173,11 @@ type ClipboardSync struct {
 	pendingMtime       time.Time
 
 	// Log/scan deduplication state.
-	lastDirMtime   time.Time
-	lastConflicts  []string
-	lastEmptyMtime time.Time
+	lastDirMtime      time.Time
+	lastConflicts     []string
+	lastEmptyMtime    time.Time
+	lastInvalidMtime  time.Time // file mtime whose content was not valid UTF-8
+	lastCopyFailMtime time.Time // file mtime whose clipboard copy last failed
 }
 
 func NewClipboardSync(path string, enableNotifications, hideNotificationContent bool) (*ClipboardSync, error) {
@@ -209,7 +212,7 @@ func newClipboardSync(path string, enableNotifications, hideNotificationContent 
 		c.initClip(clip)
 	}
 	if mtime, exists := c.getMtime(); exists {
-		if content, readOK, tooLarge := c.safeRead(); readOK {
+		if content, readOK, tooLarge := c.safeRead(mtime); readOK {
 			c.lastMtime = mtime
 			if !tooLarge {
 				c.lastFileContent = content
@@ -232,13 +235,23 @@ func ensureFileExists(path string) error {
 }
 
 func (c *ClipboardSync) initClip(clip string) {
-	if len(clip) > maxContentBytes {
-		c.oversizedClipHash = sha256.Sum256([]byte(clip))
+	if len(clip) > maxContentBytes || !utf8.ValidString(clip) {
+		c.skippedClipHash = sha256.Sum256([]byte(clip))
 		c.lastClip = ""
 	} else {
 		c.lastClip = clip
 	}
 	c.clipReady = true
+}
+
+// skipClip remembers a clipboard payload that cannot be synced (by digest only,
+// so oversized payloads are not retained) and warns once per distinct payload.
+func (c *ClipboardSync) skipClip(clip string, msg string, args ...any) {
+	digest := sha256.Sum256([]byte(clip))
+	if digest != c.skippedClipHash {
+		slog.Warn(msg, args...)
+		c.skippedClipHash = digest
+	}
 }
 
 // ------------------------------------------------------------------
@@ -301,23 +314,22 @@ func (c *ClipboardSync) safePaste() (string, bool) {
 	return "", false
 }
 
-func (c *ClipboardSync) safeCopy(content string) bool {
+func (c *ClipboardSync) safeCopy(content string) error {
+	var err error
 	for attempt := 0; attempt < ioRetries; attempt++ {
-		err := c.io.writeClip(content)
-		if err == nil {
-			return true
+		if err = c.io.writeClip(content); err == nil {
+			return nil
 		}
 		if attempt < ioRetries-1 {
 			time.Sleep(retryDelay)
-			continue
 		}
-		slog.Error("Copy failed", "err", err)
 	}
-	return false
+	return err
 }
 
 // safeRead reads at most maxContentBytes+1 raw bytes in a single open/read pass.
-func (c *ClipboardSync) safeRead() (content string, ok bool, tooLarge bool) {
+// Content that is not valid UTF-8 is rejected (ok=false), warning once per mtime.
+func (c *ClipboardSync) safeRead(mtime time.Time) (content string, ok bool, tooLarge bool) {
 	f, err := os.Open(c.filePath)
 	if err != nil {
 		slog.Debug("File read failed", "file", c.filePath, "err", err)
@@ -333,6 +345,14 @@ func (c *ClipboardSync) safeRead() (content string, ok bool, tooLarge bool) {
 	if len(data) > maxContentBytes {
 		return "", true, true
 	}
+	if !utf8.Valid(data) {
+		if mtime.IsZero() || !mtime.Equal(c.lastInvalidMtime) {
+			slog.Warn("File is not valid UTF-8, waiting", "file", c.filePath)
+		}
+		c.lastInvalidMtime = mtime
+		return "", false, false
+	}
+	c.lastInvalidMtime = time.Time{}
 	return string(data), true, false
 }
 
@@ -451,19 +471,19 @@ func (c *ClipboardSync) checkClipboard() State {
 	if currentClip == "" {
 		slog.Debug("Clipboard is empty or non-text, skipping file write")
 		c.lastClip = ""
-		c.oversizedClipHash = [sha256.Size]byte{}
+		c.skippedClipHash = [sha256.Size]byte{}
 		return Waiting
 	}
 	if len(currentClip) > maxContentBytes {
-		digest := sha256.Sum256([]byte(currentClip))
-		if digest != c.oversizedClipHash {
-			slog.Warn("Clipboard content exceeds size limit, skipping file write", "bytes", len(currentClip), "limit", maxContentBytes)
-			c.oversizedClipHash = digest
-		}
+		c.skipClip(currentClip, "Clipboard content exceeds size limit, skipping file write", "bytes", len(currentClip), "limit", maxContentBytes)
+		return Waiting
+	}
+	if !utf8.ValidString(currentClip) {
+		c.skipClip(currentClip, "Clipboard content is not valid UTF-8, skipping file write", "bytes", len(currentClip))
 		return Waiting
 	}
 
-	c.oversizedClipHash = [sha256.Size]byte{}
+	c.skippedClipHash = [sha256.Size]byte{}
 	c.pendingClip = currentClip
 	return WritingClipToFile
 }
@@ -480,8 +500,12 @@ func (c *ClipboardSync) checkFile() State {
 	if !c.lastMtime.IsZero() && currentMtime.Equal(c.lastMtime) {
 		return Waiting
 	}
+	// Don't re-read up to 5 MiB every poll for a file already known to be invalid.
+	if !c.lastInvalidMtime.IsZero() && currentMtime.Equal(c.lastInvalidMtime) {
+		return Waiting
+	}
 
-	content, readOK, tooLarge := c.safeRead()
+	content, readOK, tooLarge := c.safeRead(currentMtime)
 	if !readOK {
 		return Waiting
 	}
@@ -538,20 +562,29 @@ func (c *ClipboardSync) copyFileToClip() State {
 		return Waiting
 	}
 
-	slog.Info("File -> Clipboard", "chars", len([]rune(content)))
-	if c.safeCopy(content) {
-		c.lastClip = content
-		c.clipReady = true
-		c.lastFileContent = content
-		c.lastMtime = mtime
-		c.oversizedClipHash = [sha256.Size]byte{}
-
-		msg := compactMessage(content, 64)
-		if c.hideNotificationContent {
-			msg = "***"
+	if err := c.safeCopy(content); err != nil {
+		// Caches stay untouched so the next poll retries; log loudly only once per file version.
+		if !mtime.Equal(c.lastCopyFailMtime) {
+			slog.Error("Copy failed, will keep retrying", "err", err)
+			c.lastCopyFailMtime = mtime
+		} else {
+			slog.Debug("Copy failed again", "err", err)
 		}
-		c.showNotification("Synced to Clipboard", msg)
+		return Waiting
 	}
+	slog.Info("File -> Clipboard", "chars", len([]rune(content)))
+	c.lastCopyFailMtime = time.Time{}
+	c.lastClip = content
+	c.clipReady = true
+	c.lastFileContent = content
+	c.lastMtime = mtime
+	c.skippedClipHash = [sha256.Size]byte{}
+
+	msg := compactMessage(content, 64)
+	if c.hideNotificationContent {
+		msg = "***"
+	}
+	c.showNotification("Synced to Clipboard", msg)
 	return Waiting
 }
 
